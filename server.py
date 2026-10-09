@@ -70,6 +70,7 @@ class CameraStreamer:
         self.paused = False
         self.lock = threading.Lock()
         self.latest_jpeg = None
+        self.frame_id = 0
         self.last_hit = None
         self.cooldown_map = {}
         self.fps = 0.0
@@ -216,6 +217,7 @@ class CameraStreamer:
             # JPEG Komprimierung (Qualität 78: extrem schnell, gestochen scharf)
             _, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
             with self.lock:
+                self.frame_id += 1
                 self.latest_jpeg = jpeg_buf.tobytes()
 
             if dt < 0.033:
@@ -445,17 +447,21 @@ class RadarServerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
             self.end_headers()
 
+            last_id = -1
             try:
                 while True:
-                    frame_bytes = CAM_STREAMER.get_jpeg()
-                    if frame_bytes:
+                    with CAM_STREAMER.lock:
+                        cur_id = CAM_STREAMER.frame_id
+                        frame_bytes = CAM_STREAMER.latest_jpeg
+                    if cur_id != last_id and frame_bytes:
+                        last_id = cur_id
                         self.wfile.write(b"--FRAME\r\n")
                         self.send_header("Content-Type", "image/jpeg")
                         self.send_header("Content-Length", str(len(frame_bytes)))
                         self.end_headers()
                         self.wfile.write(frame_bytes)
                         self.wfile.write(b"\r\n")
-                    time.sleep(0.033)
+                    time.sleep(0.015)
             except (ConnectionResetError, BrokenPipeError):
                 pass
             return

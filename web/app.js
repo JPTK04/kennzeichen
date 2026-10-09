@@ -65,14 +65,20 @@ function startStatusPollingLoop() {
       }
 
       // 4. Trip Count & List
-      document.getElementById('statTrip').textContent = status.trip_count || 0;
-      document.getElementById('tripCountCaption').textContent = status.trip_count || 0;
+      const newTripCount = status.trip_count || 0;
+      document.getElementById('statTrip').textContent = newTripCount;
+      document.getElementById('tripCountCaption').textContent = newTripCount;
 
-      // Wenn sich die Trip-Länge geändert hat, Liste nachladen
-      const tripRes = await fetch('/api/data');
-      if (tripRes.ok) {
-        const full = await tripRes.json();
-        renderTripList(full.trip_log || []);
+      // Nur nachladen, wenn wirklich ein neuer Fund hinzugekommen ist
+      if (Cockpit.lastTripCount === undefined) {
+        Cockpit.lastTripCount = newTripCount;
+      } else if (newTripCount !== Cockpit.lastTripCount) {
+        Cockpit.lastTripCount = newTripCount;
+        const tripRes = await fetch('/api/data');
+        if (tripRes.ok) {
+          const full = await tripRes.json();
+          renderTripList(full.trip_log || []);
+        }
       }
     } catch (e) {
       // Offline / Stream connection

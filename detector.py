@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-High-Speed KI-Kennzeichenerkennung (ALPR) mit YOLOv8 & Asynchronem OCR
+High-Speed KI-Kennzeichenerkennung (ALPR) mit YOLOv8 & Intelligenter FE-Schrift OCR
 Optimiert für 30+ FPS Echtzeit-Tracking auf Intel Core i7 / Multi-Core CPUs.
+Strikte Links-nach-Rechts-Zonierung für korrekte deutsche Ortskürzel (ohne Plaketten/Erkennungsnummern).
 """
 
 import os
@@ -19,8 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import torch
-# Alle Performance-Cores des i7 nutzen
-torch.set_num_threads(8)
+# CPU-Threads auf 4 begrenzen, damit Video-Stream und Benutzeroberfläche flüssig bei 30+ FPS bleiben
+torch.set_num_threads(4)
 
 import cv2
 import numpy as np
@@ -46,12 +47,14 @@ class FastLicensePlateDetector:
 
         print("[KI] Initialisiere asynchrone OCR-Engine...")
         self.ocr = easyocr.Reader(['de', 'en'], gpu=False, verbose=False)
-        self.ocr_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="PlateOCR")
+        self.ocr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="PlateOCR")
 
         # Cache für aktive Kennzeichen: { grid_key: { "code", "plate", "timestamp" } }
         self.tracked_cache = {}
+        # Cooldown für fehlgeschlagene Erkennungen, um CPU-Überlastung zu verhindern: { grid_key: timestamp }
+        self.failed_cache = {}
         self.pending_crops = set()
-        print("[KI] High-Speed Pipeline mit 30+ FPS Tracking bereit!")
+        print("[KI] High-Speed Pipeline mit 30+ FPS Tracking & intelligenter Zonen-OCR bereit!")
 
     @classmethod
     def get_instance(cls):
@@ -84,43 +87,88 @@ class FastLicensePlateDetector:
         return f"{cx}_{cy}"
 
     def _async_ocr_worker(self, crop: np.ndarray, grid_key: str, alias_map: Dict[str, Any]):
-        """Läuft im Hintergrundthread: Liest Text vom Kennzeichen ohne den Videostream zu blockieren."""
+        """
+        Spezialisierte Erkennung des deutschen Kennzeichen-Ortskürzels:
+        - Strikte Sortierung von Links nach Rechts (Ortskürzel steht IMMER ganz links)
+        - Blauen EU-Balken abtrennen (erste ~12-14%)
+        - Mittige Plaketten & rechte Zufallsbuchstaben (Erkennungsnummer) ignorieren
+        - Cooldown bei Fehlversuchen, damit FPS niemals einbricht
+        """
+        now = time.time()
         try:
             ch, cw = crop.shape[:2]
-            if ch < 50 or cw < 160:
-                scale = max(50 / ch, 160 / cw)
-                crop_proc = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_CUBIC)
-            else:
-                crop_proc = crop
+            if ch < 14 or cw < 28:
+                self.failed_cache[grid_key] = now
+                return
 
-            gray = cv2.cvtColor(crop_proc, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(6, 6))
-            enhanced = clahe.apply(gray)
+            # 1. Auf optimale OCR-Höhe (90px) skalieren
+            target_h = 90
+            scale = target_h / ch
+            target_w = int(cw * scale)
+            scaled = cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
-            ocr_results = self.ocr.readtext(enhanced, detail=0)
-            raw_text = " ".join(ocr_results).upper()
+            # 2. Textboxen mit EasyOCR finden (detail=1 für X-Koordinaten)
+            results = self.ocr.readtext(scaled, detail=1)
+
+            # Strikte Sortierung von Links nach Rechts
+            sorted_boxes = sorted(results, key=lambda b: min(pt[0] for pt in b[0]))
+
+            eu_cutoff_x = target_w * 0.12 # Alles vor 12% ist der blaue EU-Streifen
+            max_prefix_x = target_w * 0.50 # Ortskürzel ist IMMER vor der Mitte (vor den Plaketten)
+
+            candidates = []
+            for bbox, text, conf in sorted_boxes:
+                x_min = min(pt[0] for pt in bbox)
+                clean = re.sub(r'[^A-ZÄÖÜ0-9]', '', text.upper())
+
+                # Liegt die Textbox im linken Prefix-Bereich vor den Plaketten?
+                if x_min >= (eu_cutoff_x - 12) and x_min <= max_prefix_x:
+                    if 1 <= len(clean) <= 3:
+                        candidates.append(clean)
+
+            # 3. Falls die Vollbild-OCR nichts fand, isolierte Prefix-Zone probieren
+            if not candidates:
+                prefix_crop = scaled[:, int(eu_cutoff_x):int(max_prefix_x)]
+                if prefix_crop.shape[1] > 15:
+                    prefix_res = self.ocr.readtext(prefix_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', detail=0)
+                    for t in prefix_res:
+                        clean = re.sub(r'[^A-ZÄÖÜ]', '', t.upper())
+                        if 1 <= len(clean) <= 3:
+                            candidates.append(clean)
 
             matched_code = None
             matched_plate = None
 
-            if alias_map and raw_text:
-                cleaned = re.sub(r'[^A-ZÄÖÜ0-9]', ' ', raw_text)
-                tokens = [t for t in cleaned.split() if 1 <= len(t) <= 3 and re.match(r'^[A-ZÄÖÜ]+$', t)]
-                for tok in tokens:
-                    if tok in alias_map:
-                        matched_code = tok
-                        matched_plate = alias_map[tok]
+            # Abgleich der linken Kandidaten gegen Kennzeichen-Stammdaten
+            for tok in candidates:
+                variants = [
+                    tok,
+                    tok.replace("0", "O").replace("1", "I").replace("8", "B"),
+                    tok.replace("O", "0")
+                ]
+                for var in variants:
+                    if alias_map and var in alias_map:
+                        matched_code = var
+                        matched_plate = alias_map[var]
                         break
+                if matched_code:
+                    break
 
             if matched_code:
                 self.tracked_cache[grid_key] = {
                     "code": matched_code,
                     "plate": matched_plate,
-                    "raw_text": raw_text,
-                    "time": time.time()
+                    "raw_text": f"[{matched_code}]",
+                    "time": now
                 }
+                # Aus dem Fehler-Cache entfernen
+                self.failed_cache.pop(grid_key, None)
+            else:
+                # Negativ-Cache: Wenn nicht erkannt, 1.5 Sekunden nicht erneut versuchen!
+                self.failed_cache[grid_key] = now
         except Exception as e:
             print(f"[!] Background OCR Fehler: {e}")
+            self.failed_cache[grid_key] = now
         finally:
             self.pending_crops.discard(grid_key)
 
@@ -132,10 +180,11 @@ class FastLicensePlateDetector:
         img, w, h = self._prepare_image(img_input)
         now = time.time()
 
-        # Altes Cache aufräumen (> 4 Sekunden)
+        # Altes Cache aufräumen
         self.tracked_cache = {k: v for k, v in self.tracked_cache.items() if now - v["time"] < 4.0}
+        self.failed_cache = {k: t for k, t in self.failed_cache.items() if now - t < 1.5}
 
-        # 1. Ultra-schnelle YOLO-Inferenz (nur 25ms auf Intel CPU)
+        # 1. Ultra-schnelle YOLO-Inferenz (nur ~25-30ms)
         results = self.yolo(img, conf=conf_thresh, imgsz=imgsz, verbose=False)
         detections = []
 
@@ -165,14 +214,18 @@ class FastLicensePlateDetector:
                 "h": round(box_h / h, 4)
             }
 
-            # Prüfen ob dieses Kennzeichen an dieser Position bereits erkannt wurde
             cached = self.tracked_cache.get(grid_key)
             matched_code = cached["code"] if cached else None
             matched_plate = cached["plate"] if cached else None
             raw_text = cached["raw_text"] if cached else ""
 
-            # Falls noch nicht erkannt und noch nicht im Hintergrundjob -> Asynchron starten!
-            if not cached and grid_key not in self.pending_crops:
+            # Nur wenn:
+            # - Noch nicht erkannt
+            # - Noch kein OCR-Job in Arbeit
+            # - Maximal 1 aktiver Job im Pool (Schutz vor CPU-Stau)
+            # - Nicht im Negativ-Cooldown (letzter Fehlversuch vor > 1.5s)
+            is_failed_recent = (now - self.failed_cache.get(grid_key, 0)) < 1.5
+            if not cached and grid_key not in self.pending_crops and len(self.pending_crops) < 1 and not is_failed_recent:
                 pad_x = int(box_w * 0.05)
                 pad_y = int(box_h * 0.05)
                 crop_x1 = max(0, x1 - pad_x)
