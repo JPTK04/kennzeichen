@@ -14,7 +14,7 @@ import urllib.parse
 import io
 import base64
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -35,8 +35,8 @@ _DETECTOR = None
 def get_detector():
     global _DETECTOR
     if _DETECTOR is None:
-        from detector import LicensePlateDetector
-        _DETECTOR = LicensePlateDetector.get_instance()
+        from detector import FastLicensePlateDetector
+        _DETECTOR = FastLicensePlateDetector.get_instance()
     return _DETECTOR
 
 # Globaler Anwendungsstatus
@@ -294,21 +294,28 @@ class RadarServerHandler(BaseHTTPRequestHandler):
         # API: KI-Kennzeichenerkennung (YOLOv8 + ALPR)
         if path == "/api/detect":
             content_length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(content_length).decode('utf-8'))
-            img_b64 = payload.get("image", "")
+            content_type = self.headers.get("Content-Type", "")
 
-            if "," in img_b64:
-                img_b64 = img_b64.split(",", 1)[1]
+            img_bytes = None
+            if "image/" in content_type:
+                img_bytes = self.rfile.read(content_length)
+            else:
+                try:
+                    payload = json.loads(self.rfile.read(content_length).decode('utf-8'))
+                    img_b64 = payload.get("image", "")
+                    if "," in img_b64:
+                        img_b64 = img_b64.split(",", 1)[1]
+                    img_bytes = base64.b64decode(img_b64)
+                except Exception as e:
+                    self.send_json({"success": False, "error": f"Payload Fehler: {e}"}, status=400)
+                    return
 
-            try:
-                img_bytes = base64.b64decode(img_b64)
-            except Exception as e:
-                self.send_json({"success": False, "error": f"Base64 Decode Fehler: {e}"}, status=400)
+            if not img_bytes:
+                self.send_json({"success": False, "error": "Keine Bilddaten empfangen"}, status=400)
                 return
 
             detector = get_detector()
-            # Erkennung mit YOLO und deutschem Kennzeichen-Lookup
-            detections = detector.detect(img_bytes, conf_thresh=0.20, imgsz=640, alias_map=APP_STATE["plates_by_alias"])
+            detections = detector.detect(img_bytes, conf_thresh=0.20, imgsz=480, alias_map=APP_STATE["plates_by_alias"])
 
             # Status (missing / seen) ermitteln
             enriched_detections = []
@@ -548,9 +555,9 @@ def run(port: int = 8080):
     load_master_data()
     auto_load_latest_backup()
 
-    server = HTTPServer(("0.0.0.0", port), RadarServerHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), RadarServerHandler)
     print(f"\n=======================================================")
-    print(f"🚀 KENNZEICHEN-RADAR SERVER AKTIV AUF PORT {port}")
+    print(f"🚀 KENNZEICHEN-RADAR SERVER AKTIV AUF PORT {port} (Threading / High-Speed)")
     print(f"💻 Laptop-Dashboard: http://localhost:{port}/")
     print(f"📱 Smartphone-Kamera: http://<Deine-WLAN-IP>:{port}/cam")
     print(f"=======================================================\n")
