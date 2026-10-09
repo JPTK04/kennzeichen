@@ -464,7 +464,11 @@ class RadarServerHandler(BaseHTTPRequestHandler):
         elif path in ("/cam", "/kamera", "/cam.html"):
             self.serve_file(STATIC_DIR / "cam.html", "text/html; charset=utf-8")
 
-        # 4. Statische Assets
+        # 4. Statische Assets & Stylesheets
+        elif path in ("/style.css", "/css/style.css"):
+            self.serve_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
+        elif path in ("/app.js", "/js/app.js"):
+            self.serve_file(STATIC_DIR / "js" / "app.js", "application/javascript; charset=utf-8")
         elif path.startswith("/static/") or path.startswith("/web/"):
             rel_path = path.split("/", 2)[-1]
             file_path = STATIC_DIR / rel_path
