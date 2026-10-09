@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Kennzeichen-Radar • Lokaler High-Speed Live-Kamera Scanner (USB / Webcam)
-100% Offline-fähig – Kein WLAN, kein Hotspot nötig!
-Direkte Kamera-Anbindung mit 30+ FPS & Echtzeit-KI auf der Laptop-CPU.
+Kennzeichen-Radar • High-Precision Intervall- & Live-Scanner (USB / Handy / Webcam)
+100% Offline-fähig – Entwickelt für Fahrten im Auto & Dashcam-Betrieb.
+
+Features:
+- Threaded Full-HD 1080p Video-Pipeline: 60 FPS flüssiger Sucher ohne Ruckeln
+- Präzisions-Intervall-Scan (z. B. jede Sekunde oder per Leertaste)
+- Erkennt automatisch Smartphone-Kameras (Android Webcam / DroidCam / Cam 1)
+- Strikte Links-nach-Rechts-Zonierung für korrekte deutsche Ortskürzel
+- Automatischer Victory-Sound, Beweisfotos in captures/ und CSV-Trip-Export
 """
 
 import sys
@@ -12,6 +18,7 @@ import winsound
 import sqlite3
 import zlib
 import tempfile
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -29,21 +36,103 @@ DOWNLOADS_DIR = Path.home() / "Downloads"
 
 from detector import FastLicensePlateDetector
 
+class ThreadedCamera:
+    """Entkoppelt das Kamerasignal in einen eigenen Thread für 60 FPS ohne Ruckeln."""
+    def __init__(self, src: int = 1, width: int = 1920, height: int = 1080):
+        self.src = src
+        self.width = width
+        self.height = height
+        self.cap = None
+        self.frame = None
+        self.ret = False
+        self.running = False
+        self.lock = threading.Lock()
+        self.thread = None
+        self.open(src)
+
+    def open(self, src: int):
+        self.release()
+        self.src = src
+        print(f"[+] Verbinde mit Kamera Index {self.src} (DirectShow Full-HD)...")
+        self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(self.src)
+
+        if self.cap.isOpened():
+            # MJPG anfordern für maximale 1080p Bildrate über USB
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self.ret, self.frame = self.cap.read()
+            self.running = True
+            self.thread = threading.Thread(target=self._capture_loop, daemon=True, name=f"Cam_{self.src}")
+            self.thread.start()
+            actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"[✓] Kamera {self.src} aktiv: {actual_w}x{actual_h} Pixel")
+        else:
+            self.running = False
+            self.ret = False
+            self.frame = None
+
+    def _capture_loop(self):
+        while self.running:
+            if self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.frame = frame
+                        self.ret = ret
+                else:
+                    time.sleep(0.02)
+            else:
+                break
+
+    def read(self):
+        with self.lock:
+            if self.frame is not None:
+                return self.ret, self.frame.copy()
+            return False, None
+
+    def release(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=0.3)
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+
 class LiveRadarApp:
-    def __init__(self, cam_index: int = 0):
-        self.cam_index = cam_index
+    def __init__(self, preferred_cam: int = 1):
         self.plates_by_id = {}
         self.plates_by_alias = {}
         self.seen_map = {}
         self.trip_log = []
-        self.cooldown_map = {} # { 'ESB': timestamp }
+        self.cooldown_map = {}
         self.backup_name = "Kein Backup"
+
+        # Scan-Konfiguration
+        self.scan_interval = 1.0       # Standard: Alle 1,0 Sekunde ein hochauflösender Scan
+        self.last_scan_time = 0.0
+        self.active_detections = []    # Letzte erkannte Bounding-Boxen
+        self.scan_in_progress = False
+        self.night_boost = False       # Kontrastverstärker für Nachtfahrten
+        self.scan_count = 0
 
         self.load_master_data()
         self.auto_load_backup()
 
         print("[+] Initialisiere KI-Erkennungsmodul...")
         self.detector = FastLicensePlateDetector.get_instance()
+
+        # Kamera initialisieren: Zuerst bevorzugte Kamera probieren (Standard: 1 = Smartphone)
+        self.cam_index = preferred_cam
+        self.cam = ThreadedCamera(src=self.cam_index, width=1920, height=1080)
+        if not self.cam.ret:
+            print(f"[!] Kamera {self.cam_index} nicht verfügbar. Wechsle zu Kamera 0...")
+            self.cam_index = 0
+            self.cam = ThreadedCamera(src=self.cam_index, width=1920, height=1080)
 
     def load_master_data(self):
         if not DATA_DB_PATH.is_file():
@@ -149,7 +238,6 @@ class LiveRadarApp:
         print(f"[+] Backup '{latest.name}' geladen: {len(self.seen_map)} / 1.069 bereits gesammelt.")
 
     def play_chime(self):
-        """Spielt einen erfreulichen Victory-Chime Ton bei Neufunden ab."""
         try:
             winsound.Beep(523, 70)   # C5
             winsound.Beep(659, 70)   # E5
@@ -159,114 +247,48 @@ class LiveRadarApp:
             pass
 
     def save_capture(self, frame: np.ndarray, plate: dict, box_px: list, conf: float):
-        """Speichert das Beweisfoto mit grünem Rahmen ab."""
         annotated = frame.copy()
         x1, y1, x2, y2 = box_px
         h, w = frame.shape[:2]
 
-        # Grüner Rahmen
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (46, 204, 113), 3)
 
-        # Banner oben
         label = f"[{plate['kuerzel']}] {plate['stadt_kreis']} • NEUER FUND (+{plate['punkte']} Pkt.)"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-        banner_y1 = max(0, y1 - th - 12)
-        cv2.rectangle(annotated, (x1, banner_y1), (x1 + tw + 16, y1), (46, 204, 113), -1)
-        cv2.putText(annotated, label, (x1 + 8, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        banner_y1 = max(0, y1 - th - 14)
+        cv2.rectangle(annotated, (x1, banner_y1), (x1 + tw + 18, y1), (46, 204, 113), -1)
+        cv2.putText(annotated, label, (x1 + 8, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
-        # Zeitstempel
         now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        cv2.putText(annotated, now_str, (w - 260, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(annotated, now_str, (w - 280, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         safe_kz = plate['kuerzel'].replace(" ", "_").replace("/", "-")
         filename = f"{timestamp}_{safe_kz}.jpg"
         out_path = CAPTURES_DIR / filename
-        cv2.imwrite(str(out_path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        print(f"[📸 NEUER FUND] {plate['kuerzel']} ({plate['stadt_kreis']}) -> Gespeichert als {filename}")
+        cv2.imwrite(str(out_path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        print(f"\n[📸 NEUER FUND] [{plate['kuerzel']}] {plate['stadt_kreis']} (+{plate['punkte']} Pkt.) -> Gespeichert in captures/{filename}")
         return filename
 
-    def run(self):
-        print(f"\n[+] Öffne Kamera Index {self.cam_index}...")
-        cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
-        
-        # HD-Auflösung anfordern
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        if not cap.isOpened():
-            print(f"[!] Konnte Kamera {self.cam_index} nicht öffnen! Versuche Standard-Backend...")
-            cap = cv2.VideoCapture(self.cam_index)
-
-        if not cap.isOpened():
-            print(f"[!] Fehler: Keine Kamera unter Index {self.cam_index} gefunden.")
-            return
-
-        window_name = "🚗 Kennzeichen Radar • Live-Scanner (Offline)"
+    def _async_scan_frame(self, frame: np.ndarray):
+        """Führt den hochauflösenden Scan im Hintergrund aus, ohne den Sucher zu blockieren."""
         try:
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window_name, 1280, 720)
-        except Exception as e:
-            print(f"[!] Warnung beim Erstellen des Anzeigefensters: {e}")
-            print("[!] Tipp: Führe 'pip install --force-reinstall opencv-python' aus.")
-
-        fps_times = []
-        last_found_banner = None
-        banner_expire = 0
-
-        print("\n" + "=" * 60)
-        print("   🚗  LIVE-SCANNER AKTIV • TASTENBELEGUNG:  🚗")
-        print("   [q] oder [ESC] : Beenden")
-        print("   [c]            : Kamera wechseln (0, 1, 2...)")
-        print("   [s]            : Schnappschuss speichern")
-        print("=" * 60 + "\n")
-
-        while True:
-            t0 = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.05)
-                continue
-
-            h, w = frame.shape[:2]
-
-            # 1. High-Speed YOLO Erkennung (Inferenz läuft in ~25-30ms)
-            detections = self.detector.detect(frame, conf_thresh=0.22, imgsz=480, alias_map=self.plates_by_alias)
-
+            self.scan_count += 1
+            # Höhere Auflösung (imgsz=640) für weite Distanzen & schärfere Zeichen
+            detections = self.detector.detect(frame, conf_thresh=0.20, imgsz=640, alias_map=self.plates_by_alias)
+            
             now = time.time()
-
-            # 2. Bounding-Boxes zeichnen
             for det in detections:
-                x1, y1, x2, y2 = det["box_px"]
-                conf = det["confidence"]
                 plate = det.get("plate")
-                code = det.get("matched_code")
-
                 if plate:
                     pid = plate["id"]
-                    is_seen = pid in self.seen_map
-                    is_missing = not is_seen
+                    is_missing = pid not in self.seen_map
 
-                    # Farbe: Grün für Neufund, Blau für bereits gesammelt
-                    color = (46, 204, 113) if is_missing else (241, 196, 15)
-
-                    # Rahmen
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-
-                    # Pill-Badge
-                    status_text = "NEU!" if is_missing else "OK"
-                    badge_label = f"[{plate['kuerzel']}] {conf:.0f}% • {status_text}"
-                    (tw, th), _ = cv2.getTextSize(badge_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    badge_y = max(0, y1 - th - 10)
-                    cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 12, y1), color, -1)
-                    cv2.putText(frame, badge_label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-
-                    # Neuer Fund erfassen (mit Cooldown-Schutz von 12 Sekunden pro Kennzeichen)
                     if is_missing:
                         last_seen_time = self.cooldown_map.get(plate['kuerzel'], 0)
                         if now - last_seen_time > 12.0:
                             self.cooldown_map[plate['kuerzel']] = now
-                            saved_file = self.save_capture(frame, plate, [x1, y1, x2, y2], conf)
+                            saved_file = self.save_capture(frame, plate, det["box_px"], det["confidence"])
                             self.trip_log.append({
                                 "kuerzel": plate['kuerzel'],
                                 "stadt_kreis": plate['stadt_kreis'],
@@ -275,62 +297,149 @@ class LiveRadarApp:
                                 "time": datetime.now().strftime("%H:%M:%S"),
                                 "image": saved_file
                             })
-                            last_found_banner = f"NEUER FUND: [{plate['kuerzel']}] (+{plate['punkte']} Pkt.) • {plate['stadt_kreis']}"
-                            banner_expire = now + 4.0
-                            self.play_chime()
+                            self.last_hit_banner = f"NEU: [{plate['kuerzel']}] (+{plate['punkte']} Pkt.) • {plate['stadt_kreis']}"
+                            self.banner_expire = now + 4.5
+                            threading.Thread(target=self.play_chime, daemon=True).start()
 
+            self.active_detections = detections
+        finally:
+            self.scan_in_progress = False
+
+    def trigger_scan(self, frame: np.ndarray):
+        if not self.scan_in_progress and frame is not None:
+            self.scan_in_progress = True
+            self.last_scan_time = time.time()
+            threading.Thread(target=self._async_scan_frame, args=(frame.copy(),), daemon=True).start()
+
+    def run(self):
+        window_name = "🚗 Kennzeichen Radar • HD-Sucher (60 FPS & Intervall-Scan)"
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 1280, 720)
+        except Exception as e:
+            print(f"[!] Fenster-Warnung: {e}")
+
+        fps_times = []
+        self.last_hit_banner = None
+        self.banner_expire = 0.0
+
+        print("\n" + "=" * 65)
+        print("   🚗  KENNZEICHEN RADAR • PRÄZISIONS-SCANNER AKTIV  🚗")
+        print("   [Leertaste]  : Sofortiger Zwangsscan auf aktuellen Frame")
+        print("   [c]          : Kamera wechseln (0 = Laptop, 1 = Handy)")
+        print("   [+] / [-]    : Scan-Takt ändern (z.B. alle 0.5s / 1.0s / 2.0s)")
+        print("   [e]          : Nacht-Boost / Kontrastfilter an/aus")
+        print("   [s]          : Manueller Schnappschuss")
+        print("   [q] / [ESC]  : Beenden & Reiseliste (CSV) exportieren")
+        print("=" * 65 + "\n")
+
+        while True:
+            t0 = time.time()
+            ret, frame = self.cam.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+
+            h, w = frame.shape[:2]
+            now = time.time()
+
+            # Nacht-Boost (CLAHE) bei Bedarf anwenden
+            if self.night_boost:
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                l, a, b_chan = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                l = clahe.apply(l)
+                enhanced = cv2.merge((l, a, b_chan))
+                frame = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+            # 1. Automatischer Intervall-Scan (z. B. alle 1,0 Sekunde)
+            if now - self.last_scan_time >= self.scan_interval:
+                self.trigger_scan(frame)
+
+            # 2. Bounding-Boxen der letzten Erkennung zeichnen
+            for det in self.active_detections:
+                x1, y1, x2, y2 = det["box_px"]
+                conf = det["confidence"]
+                plate = det.get("plate")
+
+                if plate:
+                    pid = plate["id"]
+                    is_missing = pid not in self.seen_map
+                    color = (46, 204, 113) if is_missing else (241, 196, 15)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                    status_text = "NEU!" if is_missing else "GESEHEN"
+                    badge_label = f"[{plate['kuerzel']}] {conf:.0f}% • {status_text}"
+                    (tw, th), _ = cv2.getTextSize(badge_label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+                    badge_y = max(0, y1 - th - 10)
+                    cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 14, y1), color, -1)
+                    cv2.putText(frame, badge_label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
                 else:
-                    # Bounding Box ohne erkanntes deutsches Kürzel (Gelb)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 255), 2)
                     cv2.putText(frame, f"KFZ {conf:.0f}%", (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 1)
 
-            # 3. Top HUD Status-Balken
+            # 3. FPS-Berechnung für flüssigen 60 FPS Sucher
             fps_times.append(time.time() - t0)
-            if len(fps_times) > 15:
+            if len(fps_times) > 20:
                 fps_times.pop(0)
             avg_fps = len(fps_times) / sum(fps_times) if fps_times else 0
 
-            # Dunkles HUD-Banner oben
-            cv2.rectangle(frame, (0, 0), (w, 45), (15, 23, 42), -1)
-            hud_text = f"🚗 RADAR (Kamera {self.cam_index}) | Gesehen: {len(self.seen_map)}/1.069 | Fehlend: {1069 - len(self.seen_map)} | Trip: {len(self.trip_log)} | FPS: {avg_fps:.1f}"
-            cv2.putText(frame, hud_text, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+            # 4. Elegantes HUD Banner oben
+            cv2.rectangle(frame, (0, 0), (w, 48), (15, 23, 42), -1)
 
-            # 4. Banner bei neuem Treffer
-            if last_found_banner and now < banner_expire:
+            cam_name = "Handy (Cam 1)" if self.cam_index == 1 else f"Kamera {self.cam_index}"
+            scan_pulse = "⚡ SCAN..." if self.scan_in_progress else f"Takt: {self.scan_interval:.1f}s"
+            boost_str = " | Boost: AN" if self.night_boost else ""
+
+            hud_left = f"🚗 RADAR [{cam_name} {w}x{h}] | {scan_pulse}{boost_str}"
+            hud_right = f"Gesehen: {len(self.seen_map)}/1.069 | Trip: {len(self.trip_log)} | {avg_fps:.0f} FPS"
+
+            cv2.putText(frame, hud_left, (16, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, hud_right, (w - 440, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (56, 189, 248), 2, cv2.LINE_AA)
+
+            # 5. Neufund-Banner unten
+            if self.last_hit_banner and now < self.banner_expire:
                 cv2.rectangle(frame, (0, h - 55), (w, h), (46, 204, 113), -1)
-                cv2.putText(frame, f"🎉 {last_found_banner}", (20, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame, f"🎉 {self.last_hit_banner}", (20, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 2, cv2.LINE_AA)
 
             cv2.imshow(window_name, frame)
 
             # Tastenabfrage
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27: # q oder ESC
+            if key == ord('q') or key == 27:
                 break
-            elif key == ord('c'): # Kamera wechseln
-                cap.release()
-                self.cam_index = (self.cam_index + 1) % 4
-                print(f"[+] Wechsle zu Kamera Index {self.cam_index}...")
-                cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(self.cam_index)
-            elif key == ord('s'): # Schnappschuss
+            elif key == ord(' '):  # Sofortiger Zwangsscan
+                print("[*] Manueller Zwangsscan ausgelöst...")
+                self.trigger_scan(frame)
+            elif key == ord('c'):  # Kamera wechseln
+                self.cam_index = 0 if self.cam_index == 1 else 1
+                self.cam.open(self.cam_index)
+            elif key == ord('+') or key == ord('='):
+                self.scan_interval = min(5.0, round(self.scan_interval + 0.2, 1))
+                print(f"[+] Scan-Intervall auf {self.scan_interval}s erhöht")
+            elif key == ord('-'):
+                self.scan_interval = max(0.4, round(self.scan_interval - 0.2, 1))
+                print(f"[-] Scan-Intervall auf {self.scan_interval}s verkürzt")
+            elif key == ord('e'):
+                self.night_boost = not self.night_boost
+                print(f"[+] Nacht-Boost: {'Aktiviert' if self.night_boost else 'Deaktiviert'}")
+            elif key == ord('s'):
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                 cv2.imwrite(str(CAPTURES_DIR / f"snapshot_{ts}.jpg"), frame)
-                print(f"[+] Manueller Schnappschuss gesichert: snapshot_{ts}.jpg")
+                print(f"[+] Schnappschuss gespeichert: captures/snapshot_{ts}.jpg")
 
-        cap.release()
+        self.cam.release()
         cv2.destroyAllWindows()
 
-        # Trip Log beim Beenden als CSV exportieren
         if self.trip_log:
             csv_path = BASE_DIR / f"trip_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
             with open(csv_path, "w", encoding="utf-8-sig") as f:
                 f.write("Kürzel;Ort / Landkreis;Bundesland;Punkte;Uhrzeit;Foto\n")
                 for t in self.trip_log:
                     f.write(f"{t['kuerzel']};{t['stadt_kreis']};{t['bundesland']};{t['punkte']};{t['time']};{t.get('image') or ''}\n")
-            print(f"\n[+] Trip erfolgreich exportiert nach: {csv_path.name}")
+            print(f"\n[+] Trip mit {len(self.trip_log)} Funden erfolgreich exportiert nach: {csv_path.name}")
 
 if __name__ == "__main__":
-    cam_id = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    app = LiveRadarApp(cam_index=cam_id)
+    preferred = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    app = LiveRadarApp(preferred_cam=preferred)
     app.run()

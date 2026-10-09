@@ -62,13 +62,14 @@ APP_STATE = {
 }
 
 class CameraStreamer:
-    """Verwaltet den hardware-beschleunigten Kamera-Videostream (USB / Webcam)."""
+    """Verwaltet den hardware-beschleunigten Kamera-Videostream (USB / Webcam) mit 1s-Intervall-Scan."""
     def __init__(self):
-        self.cam_index = 0
+        self.cam_index = 1 # Bevorzugt Cam 1 (Handy), Fallback auf Cam 0
         self.cap = None
         self.running = True
         self.paused = False
         self.lock = threading.Lock()
+        self.latest_frame = None
         self.latest_jpeg = None
         self.frame_id = 0
         self.last_hit = None
@@ -76,11 +77,14 @@ class CameraStreamer:
         self.fps = 0.0
         self.thread = None
         self.sound_enabled = True
+        self.active_detections = []
+        self.last_scan_time = 0.0
+        self.scan_in_progress = False
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
             self.running = True
-            self.thread = threading.Thread(target=self._capture_loop, daemon=True, name="CamCapture")
+            self.thread = threading.Thread(target=self._stream_loop, daemon=True, name="CamStreamer")
             self.thread.start()
 
     def set_camera(self, index: int):
@@ -114,62 +118,18 @@ class CameraStreamer:
         with self.lock:
             return self.latest_jpeg
 
-    def _capture_loop(self):
+    def _async_scan(self, frame_to_scan: np.ndarray):
         detector = get_detector()
-        fps_history = []
-
-        while self.running:
-            if self.paused:
-                time.sleep(0.08)
-                continue
-
-            if self.cap is None or not self.cap.isOpened():
-                # DirectShow für Windows
-                self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
-                if not self.cap.isOpened():
-                    self.cap = cv2.VideoCapture(self.cam_index)
-
-                if not self.cap.isOpened():
-                    placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
-                    cv2.putText(placeholder, f"Suche Kamera #{self.cam_index}...", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                    _, buf = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    with self.lock:
-                        self.latest_jpeg = buf.tobytes()
-                    time.sleep(1.0)
-                    continue
-
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-            t0 = time.time()
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                time.sleep(0.04)
-                continue
-
-            h, w = frame.shape[:2]
-            detections = detector.detect(frame, conf_thresh=0.22, imgsz=480, alias_map=APP_STATE["plates_by_alias"])
+        try:
+            detections = detector.detect(frame_to_scan, conf_thresh=0.20, imgsz=640, alias_map=APP_STATE["plates_by_alias"])
             now = time.time()
-
             for det in detections:
-                x1, y1, x2, y2 = det["box_px"]
-                conf = det["confidence"]
                 plate = det.get("plate")
-
+                conf = det["confidence"]
                 if plate:
                     pid = plate["id"]
                     is_seen = (pid, "deutschland") in APP_STATE["seen_map"]
                     is_missing = not is_seen
-
-                    color = (46, 204, 113) if is_missing else (241, 196, 15)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-
-                    status_text = "NEU!" if is_missing else "OK"
-                    label = f"[{plate['kuerzel']}] {conf:.0f}% • {status_text}"
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    badge_y = max(0, y1 - th - 10)
-                    cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 12, y1), color, -1)
-                    cv2.putText(frame, label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
 
                     self.last_hit = {
                         "id": pid,
@@ -190,7 +150,7 @@ class CameraStreamer:
                             ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
                             filename = f"{ts}_{safe_kz}.jpg"
                             out_path = CAPTURES_DIR / filename
-                            cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            cv2.imwrite(str(out_path), frame_to_scan, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
                             APP_STATE["trip_log"].append({
                                 "id": pid,
@@ -204,6 +164,74 @@ class CameraStreamer:
                                 "conf": conf
                             })
                             threading.Thread(target=self._play_sound, daemon=True).start()
+
+            self.active_detections = detections
+        except Exception as e:
+            print(f"[!] Scan-Fehler: {e}")
+        finally:
+            self.scan_in_progress = False
+
+    def _stream_loop(self):
+        fps_history = []
+        while self.running:
+            if self.paused:
+                time.sleep(0.08)
+                continue
+
+            if self.cap is None or not self.cap.isOpened():
+                # DirectShow mit MJPG Full-HD anfordern
+                self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(self.cam_index)
+
+                if not self.cap.isOpened():
+                    # Fallback auf Index 0 (Laptop), wenn 1 fehlschlägt
+                    if self.cam_index != 0:
+                        self.cam_index = 0
+                        continue
+                    placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    cv2.putText(placeholder, f"Suche Kamera #{self.cam_index}...", (60, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+                    _, buf = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    with self.lock:
+                        self.latest_jpeg = buf.tobytes()
+                    time.sleep(1.0)
+                    continue
+
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+            t0 = time.time()
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                time.sleep(0.02)
+                continue
+
+            now = time.time()
+
+            # Alle 1,0 Sekunde einen Snapshot im Hintergrund präzise analysieren
+            if (now - self.last_scan_time >= 1.0) and not self.scan_in_progress:
+                self.scan_in_progress = True
+                self.last_scan_time = now
+                threading.Thread(target=self._async_scan, args=(frame.copy(),), daemon=True).start()
+
+            # Aktuelle Bounding-Boxen einblenden
+            for det in self.active_detections:
+                x1, y1, x2, y2 = det["box_px"]
+                conf = det["confidence"]
+                plate = det.get("plate")
+                if plate:
+                    pid = plate["id"]
+                    is_seen = (pid, "deutschland") in APP_STATE["seen_map"]
+                    color = (46, 204, 113) if not is_seen else (241, 196, 15)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+                    status_text = "NEU!" if not is_seen else "OK"
+                    label = f"[{plate['kuerzel']}] {conf:.0f}% • {status_text}"
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    badge_y = max(0, y1 - th - 10)
+                    cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 12, y1), color, -1)
+                    cv2.putText(frame, label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
                 else:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 255), 2)
                     cv2.putText(frame, f"KFZ {conf:.0f}%", (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 1)
@@ -214,8 +242,8 @@ class CameraStreamer:
                 fps_history.pop(0)
             self.fps = round(len(fps_history) / sum(fps_history), 1) if fps_history else 0
 
-            # JPEG Komprimierung (Qualität 78: extrem schnell, gestochen scharf)
-            _, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
+            # JPEG Komprimierung für Stream
+            _, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             with self.lock:
                 self.frame_id += 1
                 self.latest_jpeg = jpeg_buf.tobytes()
