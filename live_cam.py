@@ -120,6 +120,10 @@ class LiveRadarApp:
         self.night_boost = False       # Kontrastverstärker für Nachtfahrten
         self.scan_count = 0
 
+        # Zoom-Stufen (1x, 2x, 3x, 5x Tele-Fokus)
+        self.zoom_levels = [1.0, 2.0, 3.0, 5.0]
+        self.zoom_idx = 0
+
         self.load_master_data()
         self.auto_load_backup()
 
@@ -305,6 +309,19 @@ class LiveRadarApp:
         finally:
             self.scan_in_progress = False
 
+    def apply_zoom(self, frame: np.ndarray) -> np.ndarray:
+        """Vergrößert den zentralen Straßenbereich (1x, 2x, 3x, 5x Tele-Ausschnitt)."""
+        current_zoom = self.zoom_levels[self.zoom_idx]
+        if current_zoom <= 1.0:
+            return frame
+        h, w = frame.shape[:2]
+        crop_w = int(w / current_zoom)
+        crop_h = int(h / current_zoom)
+        x1 = (w - crop_w) // 2
+        y1 = (h - crop_h) // 2
+        cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
+        return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
     def trigger_scan(self, frame: np.ndarray):
         if not self.scan_in_progress and frame is not None:
             self.scan_in_progress = True
@@ -326,6 +343,8 @@ class LiveRadarApp:
         print("\n" + "=" * 65)
         print("   🚗  KENNZEICHEN RADAR • PRÄZISIONS-SCANNER AKTIV  🚗")
         print("   [Leertaste]  : Sofortiger Zwangsscan auf aktuellen Frame")
+        print("   [z]          : Zoom umschalten (1x ➔ 2x ➔ 3x ➔ 5x)")
+        print("   [1, 2, 3, 5] : Direkt-Zoom (1x, 2x, 3x, 5x)")
         print("   [c]          : Kamera wechseln (0 = Laptop, 1 = Handy)")
         print("   [+] / [-]    : Scan-Takt ändern (z.B. alle 0.5s / 1.0s / 2.0s)")
         print("   [e]          : Nacht-Boost / Kontrastfilter an/aus")
@@ -339,6 +358,9 @@ class LiveRadarApp:
             if not ret or frame is None:
                 time.sleep(0.01)
                 continue
+
+            # Digitaler Tele-Zoom (vergrößert entfernte Autos im Zentrum)
+            frame = self.apply_zoom(frame)
 
             h, w = frame.shape[:2]
             now = time.time()
@@ -390,12 +412,14 @@ class LiveRadarApp:
             cam_name = "Handy (Cam 1)" if self.cam_index == 1 else f"Kamera {self.cam_index}"
             scan_pulse = "⚡ SCAN..." if self.scan_in_progress else f"Takt: {self.scan_interval:.1f}s"
             boost_str = " | Boost: AN" if self.night_boost else ""
+            cur_zoom = self.zoom_levels[self.zoom_idx]
+            zoom_str = f" | 🔍 {cur_zoom:.0f}x" if cur_zoom > 1.0 else " | 🔍 1x"
 
-            hud_left = f"🚗 RADAR [{cam_name} {w}x{h}] | {scan_pulse}{boost_str}"
+            hud_left = f"🚗 RADAR [{cam_name} {w}x{h}]{zoom_str} | {scan_pulse}{boost_str}"
             hud_right = f"Gesehen: {len(self.seen_map)}/1.069 | Trip: {len(self.trip_log)} | {avg_fps:.0f} FPS"
 
-            cv2.putText(frame, hud_left, (16, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, hud_right, (w - 440, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (56, 189, 248), 2, cv2.LINE_AA)
+            cv2.putText(frame, hud_left, (16, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, hud_right, (w - 440, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (56, 189, 248), 2, cv2.LINE_AA)
 
             # 5. Neufund-Banner unten
             if self.last_hit_banner and now < self.banner_expire:
@@ -411,6 +435,21 @@ class LiveRadarApp:
             elif key == ord(' '):  # Sofortiger Zwangsscan
                 print("[*] Manueller Zwangsscan ausgelöst...")
                 self.trigger_scan(frame)
+            elif key == ord('z'):  # Zoom durchschalten
+                self.zoom_idx = (self.zoom_idx + 1) % len(self.zoom_levels)
+                print(f"[🔍] Zoom auf {self.zoom_levels[self.zoom_idx]:.0f}x gesetzt")
+            elif key == ord('1'):
+                self.zoom_idx = 0
+                print("[🔍] Zoom: 1x (Normal)")
+            elif key == ord('2'):
+                self.zoom_idx = 1
+                print("[🔍] Zoom: 2x")
+            elif key == ord('3'):
+                self.zoom_idx = 2
+                print("[🔍] Zoom: 3x")
+            elif key == ord('5'):
+                self.zoom_idx = 3
+                print("[🔍] Zoom: 5x (Tele-Fokus)")
             elif key == ord('c'):  # Kamera wechseln
                 self.cam_index = 0 if self.cam_index == 1 else 1
                 self.cam.open(self.cam_index)
