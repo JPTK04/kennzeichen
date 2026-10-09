@@ -250,14 +250,14 @@ class LiveRadarApp:
         except Exception:
             pass
 
-    def save_capture(self, frame: np.ndarray, plate: dict, box_px: list, conf: float):
+    def save_capture(self, frame: np.ndarray, plate: dict, box_px: list, ocr_conf: float):
         annotated = frame.copy()
         x1, y1, x2, y2 = box_px
         h, w = frame.shape[:2]
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), (46, 204, 113), 3)
 
-        label = f"[{plate['kuerzel']}] {plate['stadt_kreis']} • NEUER FUND (+{plate['punkte']} Pkt.)"
+        label = f"[{plate['kuerzel']}] {ocr_conf:.0f}% sicher • {plate['stadt_kreis']} • NEU (+{plate['punkte']} Pkt.)"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         banner_y1 = max(0, y1 - th - 14)
         cv2.rectangle(annotated, (x1, banner_y1), (x1 + tw + 18, y1), (46, 204, 113), -1)
@@ -271,7 +271,7 @@ class LiveRadarApp:
         filename = f"{timestamp}_{safe_kz}.jpg"
         out_path = CAPTURES_DIR / filename
         cv2.imwrite(str(out_path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        print(f"\n[📸 NEUER FUND] [{plate['kuerzel']}] {plate['stadt_kreis']} (+{plate['punkte']} Pkt.) -> Gespeichert in captures/{filename}")
+        print(f"\n[📸 NEUER FUND] [{plate['kuerzel']}] ({ocr_conf:.0f}% sicher) • {plate['stadt_kreis']} (+{plate['punkte']} Pkt.) -> Gespeichert in captures/{filename}")
         return filename
 
     def _async_scan_frame(self, frame: np.ndarray):
@@ -284,7 +284,10 @@ class LiveRadarApp:
             now = time.time()
             for det in detections:
                 plate = det.get("plate")
-                if plate:
+                ocr_conf = det.get("ocr_confidence", 0.0)
+                
+                # Blitzer-Qualitätsfilter: Nur werten, wenn Zeichen mit mind. 50% Sicherheit verifiziert wurden
+                if plate and ocr_conf >= 50.0:
                     pid = plate["id"]
                     is_missing = pid not in self.seen_map
 
@@ -292,16 +295,17 @@ class LiveRadarApp:
                         last_seen_time = self.cooldown_map.get(plate['kuerzel'], 0)
                         if now - last_seen_time > 12.0:
                             self.cooldown_map[plate['kuerzel']] = now
-                            saved_file = self.save_capture(frame, plate, det["box_px"], det["confidence"])
+                            saved_file = self.save_capture(frame, plate, det["box_px"], ocr_conf)
                             self.trip_log.append({
                                 "kuerzel": plate['kuerzel'],
                                 "stadt_kreis": plate['stadt_kreis'],
                                 "bundesland": plate['bundesland'],
                                 "punkte": plate['punkte'],
+                                "sicherheit": f"{ocr_conf:.0f}%",
                                 "time": datetime.now().strftime("%H:%M:%S"),
                                 "image": saved_file
                             })
-                            self.last_hit_banner = f"NEU: [{plate['kuerzel']}] (+{plate['punkte']} Pkt.) • {plate['stadt_kreis']}"
+                            self.last_hit_banner = f"NEU: [{plate['kuerzel']}] ({ocr_conf:.0f}% sicher) • {plate['stadt_kreis']} (+{plate['punkte']} Pkt.)"
                             self.banner_expire = now + 4.5
                             threading.Thread(target=self.play_chime, daemon=True).start()
 
@@ -381,24 +385,27 @@ class LiveRadarApp:
             # 2. Bounding-Boxen der letzten Erkennung zeichnen
             for det in self.active_detections:
                 x1, y1, x2, y2 = det["box_px"]
-                conf = det["confidence"]
+                box_conf = det["confidence"]
+                ocr_conf = det.get("ocr_confidence", 0.0)
                 plate = det.get("plate")
 
-                if plate:
+                if plate and ocr_conf >= 50.0:
                     pid = plate["id"]
                     is_missing = pid not in self.seen_map
                     color = (46, 204, 113) if is_missing else (241, 196, 15)
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                    status_text = "NEU!" if is_missing else "GESEHEN"
-                    badge_label = f"[{plate['kuerzel']}] {conf:.0f}% • {status_text}"
+                    status_text = "NEU!" if is_missing else "OK"
+                    badge_label = f"[{plate['kuerzel']}] {ocr_conf:.0f}% sicher • {plate['stadt_kreis']} ({status_text})"
                     (tw, th), _ = cv2.getTextSize(badge_label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
                     badge_y = max(0, y1 - th - 10)
                     cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 14, y1), color, -1)
                     cv2.putText(frame, badge_label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
                 else:
+                    # Bounding Box erkannt, Zeichen noch in Prüfung
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 255), 2)
-                    cv2.putText(frame, f"KFZ {conf:.0f}%", (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 1)
+                    scan_hint = f"Schild ({box_conf:.0f}%) • Lese Zeichen..."
+                    cv2.putText(frame, scan_hint, (x1 + 4, max(15, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 215, 255), 2)
 
             # 3. FPS-Berechnung für flüssigen 60 FPS Sucher
             fps_times.append(time.time() - t0)

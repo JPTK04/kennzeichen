@@ -124,41 +124,45 @@ class FastLicensePlateDetector:
                 # Liegt die Textbox im linken Prefix-Bereich vor den Plaketten?
                 if x_min >= (eu_cutoff_x - 12) and x_min <= max_prefix_x:
                     if 1 <= len(clean) <= 3:
-                        candidates.append(clean)
+                        candidates.append((clean, float(conf)))
 
             # 3. Falls die Vollbild-OCR nichts fand, isolierte Prefix-Zone probieren
             if not candidates:
                 prefix_crop = scaled[:, int(eu_cutoff_x):int(max_prefix_x)]
                 if prefix_crop.shape[1] > 15:
-                    prefix_res = self.ocr.readtext(prefix_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', detail=0)
-                    for t in prefix_res:
-                        clean = re.sub(r'[^A-ZÄÖÜ]', '', t.upper())
+                    prefix_res = self.ocr.readtext(prefix_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', detail=1)
+                    for bbox, text, conf in prefix_res:
+                        clean = re.sub(r'[^A-ZÄÖÜ]', '', text.upper())
                         if 1 <= len(clean) <= 3:
-                            candidates.append(clean)
+                            candidates.append((clean, float(conf)))
 
             matched_code = None
             matched_plate = None
+            matched_conf = 0.0
 
             # Abgleich der linken Kandidaten gegen Kennzeichen-Stammdaten
-            for tok in candidates:
+            for tok, conf in candidates:
                 variants = [
-                    tok,
-                    tok.replace("0", "O").replace("1", "I").replace("8", "B"),
-                    tok.replace("O", "0")
+                    (tok, conf),
+                    (tok.replace("0", "O").replace("1", "I").replace("8", "B"), conf * 0.95),
+                    (tok.replace("O", "0"), conf * 0.95)
                 ]
-                for var in variants:
+                for var, v_conf in variants:
                     if alias_map and var in alias_map:
                         matched_code = var
                         matched_plate = alias_map[var]
+                        matched_conf = round(v_conf * 100, 1)
                         break
                 if matched_code:
                     break
 
-            if matched_code:
+            # Blitzer-Qualitätsfilter: Nur wenn die Zeichenerkennung mindestens 50% sicher ist
+            if matched_code and matched_conf >= 50.0:
                 self.tracked_cache[grid_key] = {
                     "code": matched_code,
                     "plate": matched_plate,
-                    "raw_text": f"[{matched_code}]",
+                    "ocr_conf": matched_conf,
+                    "raw_text": f"[{matched_code}] {matched_conf:.0f}%",
                     "time": now
                 }
                 # Aus dem Fehler-Cache entfernen
@@ -238,10 +242,13 @@ class FastLicensePlateDetector:
                     self.pending_crops.add(grid_key)
                     self.ocr_pool.submit(self._async_ocr_worker, crop, grid_key, alias_map)
 
+            ocr_conf = cached["ocr_conf"] if cached else 0.0
+
             detections.append({
                 "box": norm_box,
                 "box_px": [x1, y1, x2, y2],
-                "confidence": round(conf * 100, 1),
+                "confidence": round(conf * 100, 1),    # Schild-Bounding-Box Sicherheit (YOLO)
+                "ocr_confidence": ocr_conf,             # ECHTE Zeichenerkennungs-Sicherheit (z.B. 98% sicher, dass es B ist)
                 "raw_text": raw_text,
                 "matched_code": matched_code,
                 "plate": matched_plate
