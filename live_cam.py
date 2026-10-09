@@ -203,8 +203,12 @@ class LiveRadarApp:
             return
 
         window_name = "🚗 Kennzeichen Radar • Live-Scanner (Offline)"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1280, 720)
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 1280, 720)
+        except Exception as e:
+            print(f"[!] Warnung beim Erstellen des Anzeigefensters: {e}")
+            print("[!] Tipp: Führe 'pip install --force-reinstall opencv-python' aus.")
 
         fps_times = []
         last_found_banner = None
