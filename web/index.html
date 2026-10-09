@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Kennzeichen Radar • Sammler & Live-Scanner</title>
+  
+  <!-- Modern Typography from Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Offline Tesseract.js -->
+  <script src="/static/tesseract.min.js"></script>
+  
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- TOP NAVIGATION & HEADER -->
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="brand-badge">
+          <span class="eu-blue">D</span>
+          <span class="brand-icon">⚡</span>
+        </div>
+        <div class="brand-titles">
+          <h1>Kennzeichen<span>Radar</span></h1>
+          <p class="brand-subtitle">Echtzeit-Checker & Roadtrip-Scanner</p>
+        </div>
+      </div>
+
+      <!-- Backup Status Pill -->
+      <div class="backup-pill" id="backupStatusPill" title="Klicken für Backup-Manager">
+        <span class="pulse-indicator"></span>
+        <span class="backup-name" id="pillBackupName">Lädt Backup...</span>
+        <span class="backup-count" id="pillSeenCount">-- / --</span>
+      </div>
+    </header>
+
+    <!-- MOBILE CAMERA BANNER -->
+    <div class="mobile-connect-banner">
+      <div class="banner-icon">📱</div>
+      <div class="banner-text">
+        <strong>Smartphone als Auto-Kamera nutzen:</strong> Öffne auf deinem Handy im Browser <a href="http://10.99.192.116:8080/cam" target="_blank">http://10.99.192.116:8080/cam</a> für den optimierten Vollbild-Scanner!
+      </div>
+      <a href="/cam" target="_blank" class="btn-open-cam">Kamera-Modus öffnen ↗</a>
+    </div>
+
+    <!-- KPI / PROGRESS HERO BAR -->
+    <section class="kpi-hero">
+      <div class="kpi-card highlight-missing">
+        <div class="kpi-icon">🔍</div>
+        <div class="kpi-data">
+          <span class="kpi-value" id="kpiMissingCount">--</span>
+          <span class="kpi-label">Noch fehlend</span>
+        </div>
+        <div class="kpi-sub" id="kpiMissingSub">von 1.069 Kennzeichen</div>
+      </div>
+
+      <div class="kpi-card highlight-seen">
+        <div class="kpi-icon">✅</div>
+        <div class="kpi-data">
+          <span class="kpi-value" id="kpiSeenCount">--</span>
+          <span class="kpi-label">Bereits gesehen</span>
+        </div>
+        <div class="kpi-sub" id="kpiSeenPercent">-- % gesammelt</div>
+      </div>
+
+      <div class="kpi-card highlight-points">
+        <div class="kpi-icon">🏆</div>
+        <div class="kpi-data">
+          <span class="kpi-value" id="kpiPointsCount">--</span>
+          <span class="kpi-label">Sammler-Punkte</span>
+        </div>
+        <div class="kpi-sub" id="kpiPointsTotal">Mögliche Punkte</div>
+      </div>
+
+      <div class="kpi-card highlight-trip" id="kpiTripCard">
+        <div class="kpi-icon">🚗</div>
+        <div class="kpi-data">
+          <span class="kpi-value" id="kpiTripCount">0</span>
+          <span class="kpi-label">Trip-Merkliste</span>
+        </div>
+        <div class="kpi-sub">Heute entdeckt</div>
+      </div>
+    </section>
+
+    <!-- NAVIGATION TABS -->
+    <nav class="nav-tabs" role="tablist">
+      <button class="nav-tab active" data-tab="tab-scanner" role="tab" id="btnTabScanner">
+        <span class="tab-icon">🎯</span>
+        <span class="tab-text">Scanner & Schnellcheck</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-missing" role="tab" id="btnTabMissing">
+        <span class="tab-icon">📋</span>
+        <span class="tab-text">Fehlende Liste</span>
+        <span class="tab-counter" id="tabCounterMissing">0</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-trip" role="tab" id="btnTabTrip">
+        <span class="tab-icon">🚗</span>
+        <span class="tab-text">Trip-Merkliste</span>
+        <span class="tab-counter trip-badge" id="tabCounterTrip">0</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-stats" role="tab" id="btnTabStats">
+        <span class="tab-icon">📊</span>
+        <span class="tab-text">Bundesländer</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-backup" role="tab" id="btnTabBackup">
+        <span class="tab-icon">📁</span>
+        <span class="tab-text">Backup</span>
+      </button>
+    </nav>
+
+    <!-- TAB 1: SCANNER & SCHNELLCHECK -->
+    <main class="tab-content active" id="tab-scanner">
+      <div class="scanner-split-layout">
+        <!-- LINKER BEREICH: BLITZEINGABE & LIVE-KENNZEICHEN -->
+        <section class="quick-check-panel glass-card">
+          <div class="panel-header">
+            <h2>⚡ Schnelleingabe</h2>
+            <p>Tippe 1–3 Buchstaben (z. B. HVL, ESB, FR, B) für sofortigen Abgleich</p>
+          </div>
+
+          <div class="search-input-wrapper">
+            <input type="text" id="quickInput" placeholder="Kürzel eingeben..." autocomplete="off" autofocus maxlength="10">
+            <button class="btn-clear-input" id="btnClearInput" title="Leeren">✕</button>
+          </div>
+
+          <!-- KENNZEICHEN VISUALISIERUNG -->
+          <div class="plate-stage">
+            <div class="german-plate-display" id="plateDisplay">
+              <div class="eu-stripe">
+                <div class="eu-stars">★★★★★★</div>
+                <div class="eu-d">D</div>
+              </div>
+              <div class="plate-text-area">
+                <div class="plate-letters" id="plateLetters">HVL</div>
+                <div class="plate-stickers">
+                  <span class="hu-sticker"></span>
+                  <span class="wappen-sticker"></span>
+                </div>
+                <div class="plate-sample-number">AB 123</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- RESULT STATUS BOX -->
+          <div class="status-result-card" id="statusResultCard">
+            <div class="status-badge" id="statusBadge">Tippe ein Kürzel ein</div>
+            <h3 class="status-title" id="statusTitle">Bereit zum Prüfen</h3>
+            <p class="status-desc" id="statusDesc">Tippe oben ein Kennzeichen-Kürzel ein oder starte unten die Kamera.</p>
+            
+            <div class="status-details" id="statusDetails" style="display: none;">
+              <div class="detail-item">
+                <span class="detail-lbl">Ort / Landkreis:</span>
+                <span class="detail-val" id="detailOrt">-</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-lbl">Bundesland:</span>
+                <span class="detail-val" id="detailBundesland">-</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-lbl">Punkte:</span>
+                <span class="detail-val" id="detailPunkte">-</span>
+              </div>
+            </div>
+
+            <!-- ACTION BUTTONS -->
+            <div class="status-actions" id="statusActions" style="display: none;">
+              <button class="btn-primary" id="btnAddToTrip">
+                <span>➕</span> Zur Trip-Merkliste hinzufügen (Enter)
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- RECHTER BEREICH: LIVE KAMERA SCANNER -->
+        <section class="camera-scanner-panel glass-card">
+          <div class="panel-header">
+            <h2>📷 Kamera-Scanner (OCR)</h2>
+            <p>Erkennt Kennzeichen per Smartphone-Kamera oder Webcam</p>
+          </div>
+
+          <div class="camera-viewport" id="cameraViewport">
+            <!-- Video Element -->
+            <video id="cameraVideo" autoplay playsinline muted></video>
+            <canvas id="cameraCanvas" style="display: none;"></canvas>
+
+            <!-- Guide Overlay Frame -->
+            <div class="camera-frame-guide" id="cameraGuide">
+              <div class="guide-corners"></div>
+              <div class="guide-text">Kennzeichen hier ausrichten</div>
+            </div>
+
+            <!-- OCR Spinner / State -->
+            <div class="ocr-status-overlay" id="ocrOverlay" style="display: none;">
+              <div class="spinner"></div>
+              <span id="ocrStatusText">Erkenne Kennzeichen...</span>
+            </div>
+
+            <!-- Placeholder wenn Kamera aus -->
+            <div class="camera-placeholder" id="cameraPlaceholder">
+              <div class="placeholder-icon">📸</div>
+              <p>Kamera ist aktuell deaktiviert.</p>
+              <button class="btn-primary" id="btnStartCamera">
+                Kamera starten
+              </button>
+            </div>
+          </div>
+
+          <!-- Camera Controls -->
+          <div class="camera-controls">
+            <button class="btn-control" id="btnToggleCamera" style="display: none;">
+              <span>⏹</span> Stopp
+            </button>
+            <button class="btn-control" id="btnSwitchCamera" style="display: none;" title="Kamera wechseln">
+              <span>🔄</span> Kamera wechseln
+            </button>
+            <button class="btn-control highlight" id="btnSnapScan" style="display: none;">
+              <span>⚡</span> Jetzt scannen
+            </button>
+            <label class="btn-control upload-btn" title="Foto hochladen">
+              <span>📁</span> Foto hochladen
+              <input type="file" id="filePhotoInput" accept="image/*" style="display: none;">
+            </label>
+          </div>
+
+          <!-- Live Scan Auto Toggle -->
+          <div class="auto-scan-toggle-row">
+            <label class="toggle-switch">
+              <input type="checkbox" id="chkAutoScan">
+              <span class="toggle-slider"></span>
+            </label>
+            <span>Dauerscan (alle 1,5s automatisch scannen)</span>
+          </div>
+
+          <!-- Auto-Collect Toggle -->
+          <div class="auto-scan-toggle-row" style="margin-top: 0.4rem;">
+            <label class="toggle-switch">
+              <input type="checkbox" id="chkAutoCollect" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <span style="color: #34d399; font-weight: 600;">⚡ Auto-Sammeln (Fehlende Funde direkt auf Trip-Liste)</span>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- TAB 2: FEHLENDE KENNZEICHEN LISTE -->
+    <section class="tab-content" id="tab-missing">
+      <div class="glass-card list-container-card">
+        <!-- FILTER BAR -->
+        <div class="filter-header-bar">
+          <div class="search-box">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="filterSearchInput" placeholder="Suche nach Kürzel, Stadt, Landkreis, Ableitung...">
+          </div>
+
+          <div class="view-toggles">
+            <button class="toggle-btn active" data-view="missing" id="btnViewMissing">Nur Fehlende (<span id="countViewMissing">0</span>)</button>
+            <button class="toggle-btn" data-view="seen" id="btnViewSeen">Bereits Gesehen (<span id="countViewSeen">0</span>)</button>
+            <button class="toggle-btn" data-view="all" id="btnViewAll">Alle (1.069)</button>
+          </div>
+
+          <div class="sort-selector">
+            <label for="sortSelect">Sortierung:</label>
+            <select id="sortSelect">
+              <option value="points-desc">Höchste Punkte (Selten)</option>
+              <option value="points-asc">Niedrigste Punkte (Häufig)</option>
+              <option value="alpha-asc">Kürzel (A–Z)</option>
+              <option value="bundesland">Bundesland</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- BUNDESLAND CHIPS -->
+        <div class="bundesland-chips-wrapper">
+          <div class="bundesland-chips" id="bundeslandChipsContainer">
+            <!-- Chips werden dynamisch gerendert -->
+          </div>
+        </div>
+
+        <!-- CARDS GRID -->
+        <div class="plates-grid" id="platesGridContainer">
+          <!-- Dynamisch erzeugte Kennzeichen-Karten -->
+        </div>
+
+        <!-- Empty State -->
+        <div class="empty-state" id="platesEmptyState" style="display: none;">
+          <div class="empty-icon">🎉</div>
+          <h3>Keine Kennzeichen gefunden</h3>
+          <p>Für die aktuellen Filterkriterien gibt es keine Treffer.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: TRIP-MERKLISTE -->
+    <section class="tab-content" id="tab-trip">
+      <div class="glass-card trip-card">
+        <div class="trip-header">
+          <div class="trip-title-area">
+            <h2>🚗 Heutige Trip-Merkliste</h2>
+            <p>Sammle alle Funde während der Fahrt. Am Ende des Tages einfach in die Android-App eintragen!</p>
+          </div>
+          <div class="trip-actions-top">
+            <button class="btn-primary" id="btnCopyForApp">
+              <span>📋</span> Liste für App kopieren
+            </button>
+            <button class="btn-secondary" id="btnExportTripCsv">
+              <span>📥</span> CSV exportieren
+            </button>
+            <button class="btn-danger" id="btnClearTrip">
+              <span>🗑</span> Liste leeren
+            </button>
+          </div>
+        </div>
+
+        <div class="trip-stats-bar">
+          <div class="trip-stat-item">
+            <span class="trip-stat-val" id="tripTotalPlates">0</span>
+            <span class="trip-stat-lbl">Gefundene Kennzeichen</span>
+          </div>
+          <div class="trip-stat-item">
+            <span class="trip-stat-val" id="tripTotalPoints">0</span>
+            <span class="trip-stat-lbl">Erbeutete Punkte</span>
+          </div>
+        </div>
+
+        <!-- TRIP TABLE -->
+        <div class="trip-table-wrapper">
+          <table class="trip-table">
+            <thead>
+              <tr>
+                <th style="width: 80px; text-align: center;">Foto / Beweis</th>
+                <th>Kürzel</th>
+                <th>Stadt / Landkreis</th>
+                <th>Bundesland</th>
+                <th>Punkte</th>
+                <th>Uhrzeit</th>
+                <th>Aktion</th>
+              </tr>
+            </thead>
+            <tbody id="tripTableBody">
+              <!-- Dynamisch -->
+            </tbody>
+          </table>
+          <div class="empty-trip" id="emptyTripMessage">
+            <div class="empty-icon">🚗</div>
+            <h3>Noch keine Kennzeichen auf dem Trip vermerkt</h3>
+            <p>Nutze den Scanner oder die Schnelleingabe, um gefundene Kennzeichen hinzuzufügen.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: BUNDESLÄNDER STATISTIK -->
+    <section class="tab-content" id="tab-stats">
+      <div class="glass-card stats-card">
+        <div class="panel-header">
+          <h2>📊 Bundesland-Radar & Fortschritt</h2>
+          <p>Klicke auf ein Bundesland, um direkt die noch fehlenden Kennzeichen anzuzeigen</p>
+        </div>
+
+        <div class="bundesland-grid" id="bundeslandGrid">
+          <!-- Dynamische Fortschritts-Karten -->
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: BACKUP MANAGER -->
+    <section class="tab-content" id="tab-backup">
+      <div class="glass-card backup-card">
+        <div class="panel-header">
+          <h2>📁 Backup Datei laden</h2>
+          <p>Lade dein App-Backup hier hoch (z. B. "KennzeichensammlerBackupX-08.10.2026" oder "kennzeichen_clean.db").</p>
+        </div>
+
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-icon">📤</div>
+          <h3>Backup hier hineinziehen</h3>
+          <p>oder klicken, um eine Datei auszuwählen</p>
+          <input type="file" id="fileBackupInput" style="display: none;">
+          <button class="btn-primary" id="btnSelectBackup">Datei auswählen</button>
+        </div>
+
+        <div class="backup-info-panel" id="backupInfoPanel">
+          <h3>Aktiver Backup-Status</h3>
+          <div class="info-row">
+            <span class="lbl">Dateiname:</span>
+            <span class="val" id="infoFileName">-</span>
+          </div>
+          <div class="info-row">
+            <span class="lbl">Gesehene Kennzeichen (Gesamt):</span>
+            <span class="val" id="infoTotalSeen">-</span>
+          </div>
+          <div class="info-row">
+            <span class="lbl">Davon Deutschland:</span>
+            <span class="val" id="infoDeSeen">-</span>
+          </div>
+          <div class="info-row">
+            <span class="lbl">Letzter erfasster Eintrag:</span>
+            <span class="val" id="infoLatestDate">-</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TOAST NOTIFICATION CONTAINER -->
+    <div class="toast-container" id="toastContainer"></div>
+  </div>
+
+  <!-- PHOTO LIGHTBOX MODAL -->
+  <div class="photo-modal" id="photoModal" style="display: none;">
+    <div class="photo-modal-backdrop" id="modalBackdrop"></div>
+    <div class="photo-modal-content">
+      <button class="modal-close-btn" id="btnModalClose">✕</button>
+      <img id="modalImg" src="" alt="Kennzeichen Erkennung Foto">
+      <div class="modal-caption" id="modalCaption"></div>
+    </div>
+  </div>
+
+  <!-- APPLICATION LOGIC -->
+  <script src="/static/app.js"></script>
+</body>
+</html>

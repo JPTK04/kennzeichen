@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Kennzeichen Radar • Kamera-Modus</title>
+  
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800&family=JetBrains+Mono:wght@700;800&display=swap" rel="stylesheet">
+  
+  <!-- Tesseract.js -->
+  <script src="/static/tesseract.min.js"></script>
+
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      background: #000;
+      color: #fff;
+      font-family: 'Outfit', -apple-system, sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      width: 100vw;
+      user-select: none;
+    }
+
+    /* FULLSCREEN CAMERA VIEWPORT */
+    .cam-container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+
+    #videoFeed {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    #aiOverlayCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 15;
+    }
+
+    /* VIRTUAL CANVAS FOR CROPPING & OCR */
+    #cropCanvas, #fullCanvas {
+      display: none;
+    }
+
+    /* TOP HUD BAR */
+    .top-hud {
+      position: absolute;
+      top: env(safe-area-inset-top, 12px);
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 50;
+      pointer-events: auto;
+    }
+
+    .hud-pill {
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 6px 14px;
+      border-radius: 9999px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    }
+
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0% { opacity: 0.6; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.15); }
+      100% { opacity: 0.6; transform: scale(0.9); }
+    }
+
+    .hud-controls {
+      display: flex;
+      gap: 8px;
+    }
+
+    .hud-btn {
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #fff;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.15rem;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+      transition: transform 0.15s ease;
+    }
+
+    .hud-btn:active {
+      transform: scale(0.92);
+    }
+
+    /* CENTER TARGET FRAME */
+    .target-frame-wrapper {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 84vw;
+      max-width: 420px;
+      height: 95px;
+      pointer-events: none;
+      z-index: 20;
+    }
+
+    .target-frame {
+      width: 100%;
+      height: 100%;
+      border: 2px dashed rgba(255, 255, 255, 0.6);
+      border-radius: 12px;
+      position: relative;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .target-frame.detected-missing {
+      border: 3.5px solid #10b981;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35), 0 0 35px #10b981;
+      animation: flashGreen 0.5s ease-out;
+    }
+
+    @keyframes flashGreen {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.04); }
+      100% { transform: scale(1); }
+    }
+
+    .target-frame.detected-seen {
+      border: 3px solid #3b82f6;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35), 0 0 25px #3b82f6;
+    }
+
+    .corner {
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      border-color: #38bdf8;
+      border-style: solid;
+    }
+    .corner.tl { top: -2px; left: -2px; border-width: 3px 0 0 3px; border-top-left-radius: 10px; }
+    .corner.tr { top: -2px; right: -2px; border-width: 3px 3px 0 0; border-top-right-radius: 10px; }
+    .corner.bl { bottom: -2px; left: -2px; border-width: 0 0 3px 3px; border-bottom-left-radius: 10px; }
+    .corner.br { bottom: -2px; right: -2px; border-width: 0 3px 3px 0; border-bottom-right-radius: 10px; }
+
+    .target-label {
+      position: absolute;
+      top: -28px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.7);
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      color: rgba(255, 255, 255, 0.85);
+      font-weight: 600;
+      white-space: nowrap;
+      letter-spacing: 0.04em;
+    }
+
+    /* SCANNER LASER ANIMATION */
+    .laser-line {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #38bdf8, transparent);
+      box-shadow: 0 0 8px #38bdf8;
+      animation: scanSweep 2s ease-in-out infinite;
+    }
+
+    @keyframes scanSweep {
+      0% { top: 10%; opacity: 0.3; }
+      50% { top: 90%; opacity: 1; }
+      100% { top: 10%; opacity: 0.3; }
+    }
+
+    /* BOTTOM RESULT HUD */
+    .bottom-hud {
+      position: absolute;
+      bottom: env(safe-area-inset-bottom, 20px);
+      left: 14px;
+      right: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 50;
+      pointer-events: auto;
+    }
+
+    .result-banner {
+      background: rgba(15, 23, 42, 0.92);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 18px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+      transition: all 0.25s ease;
+    }
+
+    .result-banner.banner-missing {
+      background: rgba(6, 78, 59, 0.92);
+      border-color: #10b981;
+      box-shadow: 0 0 25px rgba(16, 185, 129, 0.4);
+    }
+
+    .result-banner.banner-seen {
+      background: rgba(30, 58, 138, 0.9);
+      border-color: #3b82f6;
+    }
+
+    .plate-badge-preview {
+      display: inline-flex;
+      align-items: center;
+      background: #fff;
+      border: 2px solid #000;
+      border-radius: 6px;
+      overflow: hidden;
+      height: 48px;
+      min-width: 130px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
+    }
+
+    .plate-badge-preview .eu {
+      background: #003399;
+      color: #fff;
+      font-weight: 800;
+      font-size: 0.85rem;
+      padding: 0 6px;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      border-right: 2px solid #000;
+    }
+
+    .plate-badge-preview .letters {
+      color: #000;
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 800;
+      font-size: 1.6rem;
+      padding: 0 10px;
+      letter-spacing: 0.05em;
+    }
+
+    .banner-text-info {
+      flex: 1;
+      margin-left: 14px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .banner-status-title {
+      font-size: 1.05rem;
+      font-weight: 800;
+      line-height: 1.2;
+    }
+
+    .banner-missing .banner-status-title { color: #34d399; }
+    .banner-seen .banner-status-title { color: #93c5fd; }
+
+    .banner-sub {
+      font-size: 0.8rem;
+      color: rgba(255, 255, 255, 0.75);
+      margin-top: 2px;
+    }
+
+    .banner-photo-saved {
+      font-size: 0.72rem;
+      color: #fde047;
+      font-weight: 700;
+      margin-top: 3px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* ACTION BAR */
+    .quick-action-bar {
+      display: flex;
+      gap: 10px;
+    }
+
+    .action-btn {
+      flex: 1;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #fff;
+      border-radius: 12px;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.9rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+
+    .action-btn:active {
+      background: rgba(255, 255, 255, 0.25);
+    }
+
+    .action-btn.snap-btn {
+      background: linear-gradient(135deg, #10b981, #059669);
+      border-color: #10b981;
+    }
+
+    /* OVERLAY FLASH */
+    .flash-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(16, 185, 129, 0.4);
+      opacity: 0;
+      pointer-events: none;
+      z-index: 100;
+      transition: opacity 0.1s ease;
+    }
+
+    .flash-overlay.active {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <div class="cam-container">
+    <!-- Camera Video Stream -->
+    <video id="videoFeed" autoplay playsinline muted></video>
+    <!-- AI Bounding Box Overlay Canvas -->
+    <canvas id="aiOverlayCanvas"></canvas>
+    
+    <!-- Hidden Canvases for Frame Grabbing & Cropping -->
+    <canvas id="cropCanvas"></canvas>
+    <canvas id="fullCanvas"></canvas>
+
+    <!-- Green Screen Flash on Success -->
+    <div class="flash-overlay" id="flashOverlay"></div>
+
+    <!-- Top Status HUD -->
+    <header class="top-hud">
+      <div class="hud-pill">
+        <span class="pulse-dot"></span>
+        <span id="txtConnection">Mit Laptop verbunden</span>
+      </div>
+
+      <div class="hud-controls">
+        <div class="hud-pill" id="tripPill">
+          <span>🚗</span>
+          <span id="txtTripCount">0</span>
+          <span>heute</span>
+        </div>
+        <button class="hud-btn" id="btnSwitchCam" title="Kamera wechseln">🔄</button>
+      </div>
+    </header>
+
+    <!-- Center Target Frame (License Plate Guide) -->
+    <div class="target-frame-wrapper" id="targetWrapper">
+      <div class="target-frame" id="targetFrame">
+        <span class="corner tl"></span>
+        <span class="corner tr"></span>
+        <span class="corner bl"></span>
+        <span class="corner br"></span>
+        <div class="laser-line"></div>
+        <div class="target-label">KENNZEICHEN HIER AUSRICHTEN</div>
+      </div>
+    </div>
+
+    <!-- Bottom Result & Detection HUD -->
+    <footer class="bottom-hud">
+      <div class="result-banner" id="resultBanner">
+        <div class="plate-badge-preview">
+          <span class="eu">D</span>
+          <span class="letters" id="bannerLetters">---</span>
+        </div>
+        <div class="banner-text-info">
+          <div class="banner-status-title" id="bannerTitle">Scanne Straße...</div>
+          <div class="banner-sub" id="bannerSub">Kamera auf vorausfahrende Autos richten</div>
+          <div class="banner-photo-saved" id="bannerPhotoNotice" style="display: none;">
+            <span>📸</span> <span>Foto mit grünem Rahmen auf Laptop gesichert</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="quick-action-bar">
+        <button class="action-btn snap-btn" id="btnManualSnap">
+          <span>⚡</span> Manuell scannen
+        </button>
+        <button class="action-btn" id="btnPause">
+          <span id="btnPauseIcon">⏸</span> <span id="btnPauseText">Pause</span>
+        </button>
+      </div>
+    </footer>
+  </div>
+
+  <script src="/static/cam.js"></script>
+</body>
+</html>
