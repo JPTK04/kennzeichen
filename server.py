@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Kennzeichen-Radar Backend Server mit KI-Kennzeichenerkennung (YOLOv8 + ALPR)
-Vollständiges Tool: Backup-Upload bis zum automatischen Live-Erkennen auf der Straße.
+Kennzeichen-Radar • Minimalistisches All-in-One Cockpit & REST-Server
+Integrierter High-Speed Live-Kamerastream (MJPEG, 30+ FPS), KI-Kennzeichenerkennung (YOLOv8)
+und automatische Fund-Verwaltung direkt im Browser ohne Scrollen.
 """
 
 import os
 import sys
 import zlib
 import json
+import time
 import sqlite3
 import tempfile
 import urllib.parse
+import threading
 import io
 import base64
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Dict, Any, List
+
+import cv2
+import numpy as np
 
 # UTF-8 Konsole
 sys.stdout.reconfigure(encoding='utf-8')
@@ -29,13 +35,14 @@ CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DB_PATH = BASE_DIR / "data" / "data.db"
 DOWNLOADS_DIR = Path.home() / "Downloads"
 
+from detector import FastLicensePlateDetector
+
 # Lazy-loaded Detector
 _DETECTOR = None
 
 def get_detector():
     global _DETECTOR
     if _DETECTOR is None:
-        from detector import FastLicensePlateDetector
         _DETECTOR = FastLicensePlateDetector.get_instance()
     return _DETECTOR
 
@@ -53,6 +60,168 @@ APP_STATE = {
         "date": "-"
     }
 }
+
+class CameraStreamer:
+    """Verwaltet den hardware-beschleunigten Kamera-Videostream (USB / Webcam)."""
+    def __init__(self):
+        self.cam_index = 0
+        self.cap = None
+        self.running = True
+        self.paused = False
+        self.lock = threading.Lock()
+        self.latest_jpeg = None
+        self.last_hit = None
+        self.cooldown_map = {}
+        self.fps = 0.0
+        self.thread = None
+        self.sound_enabled = True
+
+    def start(self):
+        if self.thread is None or not self.thread.is_alive():
+            self.running = True
+            self.thread = threading.Thread(target=self._capture_loop, daemon=True, name="CamCapture")
+            self.thread.start()
+
+    def set_camera(self, index: int):
+        with self.lock:
+            self.cam_index = index
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        return self.paused
+
+    def toggle_sound(self):
+        self.sound_enabled = not self.sound_enabled
+        return self.sound_enabled
+
+    def _play_sound(self):
+        if not self.sound_enabled:
+            return
+        try:
+            import winsound
+            winsound.Beep(523, 60)
+            winsound.Beep(659, 60)
+            winsound.Beep(784, 60)
+            winsound.Beep(1046, 120)
+        except Exception:
+            pass
+
+    def get_jpeg(self) -> bytes:
+        with self.lock:
+            return self.latest_jpeg
+
+    def _capture_loop(self):
+        detector = get_detector()
+        fps_history = []
+
+        while self.running:
+            if self.paused:
+                time.sleep(0.08)
+                continue
+
+            if self.cap is None or not self.cap.isOpened():
+                # DirectShow für Windows
+                self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(self.cam_index)
+
+                if not self.cap.isOpened():
+                    placeholder = np.zeros((480, 854, 3), dtype=np.uint8)
+                    cv2.putText(placeholder, f"Suche Kamera #{self.cam_index}...", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                    _, buf = cv2.imencode('.jpg', placeholder, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    with self.lock:
+                        self.latest_jpeg = buf.tobytes()
+                    time.sleep(1.0)
+                    continue
+
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+            t0 = time.time()
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                time.sleep(0.04)
+                continue
+
+            h, w = frame.shape[:2]
+            detections = detector.detect(frame, conf_thresh=0.22, imgsz=480, alias_map=APP_STATE["plates_by_alias"])
+            now = time.time()
+
+            for det in detections:
+                x1, y1, x2, y2 = det["box_px"]
+                conf = det["confidence"]
+                plate = det.get("plate")
+
+                if plate:
+                    pid = plate["id"]
+                    is_seen = (pid, "deutschland") in APP_STATE["seen_map"]
+                    is_missing = not is_seen
+
+                    color = (46, 204, 113) if is_missing else (241, 196, 15)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+                    status_text = "NEU!" if is_missing else "OK"
+                    label = f"[{plate['kuerzel']}] {conf:.0f}% • {status_text}"
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    badge_y = max(0, y1 - th - 10)
+                    cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 12, y1), color, -1)
+                    cv2.putText(frame, label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+
+                    self.last_hit = {
+                        "id": pid,
+                        "kuerzel": plate["kuerzel"],
+                        "stadt_kreis": plate["stadt_kreis"],
+                        "bundesland": plate["bundesland"],
+                        "punkte": plate["punkte"],
+                        "status": "missing" if is_missing else "seen",
+                        "conf": conf,
+                        "time": datetime.now().strftime("%H:%M:%S")
+                    }
+
+                    if is_missing:
+                        last_t = self.cooldown_map.get(plate["kuerzel"], 0)
+                        if now - last_t > 12.0:
+                            self.cooldown_map[plate["kuerzel"]] = now
+                            safe_kz = plate['kuerzel'].replace(" ", "_").replace("/", "-")
+                            ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                            filename = f"{ts}_{safe_kz}.jpg"
+                            out_path = CAPTURES_DIR / filename
+                            cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+                            APP_STATE["trip_log"].append({
+                                "id": pid,
+                                "kuerzel": plate["kuerzel"],
+                                "stadt_kreis": plate["stadt_kreis"],
+                                "bundesland": plate["bundesland"],
+                                "punkte": plate["punkte"],
+                                "source": "usb_cam",
+                                "time": datetime.now().strftime("%H:%M:%S"),
+                                "image": filename,
+                                "conf": conf
+                            })
+                            threading.Thread(target=self._play_sound, daemon=True).start()
+                else:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 255), 2)
+                    cv2.putText(frame, f"KFZ {conf:.0f}%", (x1 + 4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 215, 255), 1)
+
+            dt = time.time() - t0
+            fps_history.append(dt)
+            if len(fps_history) > 15:
+                fps_history.pop(0)
+            self.fps = round(len(fps_history) / sum(fps_history), 1) if fps_history else 0
+
+            # JPEG Komprimierung (Qualität 78: extrem schnell, gestochen scharf)
+            _, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
+            with self.lock:
+                self.latest_jpeg = jpeg_buf.tobytes()
+
+            if dt < 0.033:
+                time.sleep(0.033 - dt)
+
+CAM_STREAMER = CameraStreamer()
 
 def load_master_data():
     """Lädt alle deutschen Kennzeichen aus data/data.db."""
@@ -126,14 +295,12 @@ def load_master_data():
 
 def parse_backup_bytes(data: bytes, filename: str = "Unbekannt"):
     """Dekomprimiert und parst ein Android-App-Backup (.db oder binär zlib/KX1)."""
-    # 1. Zlib Decompression falls nötig
     if data.startswith(b"\x78\x9c") or data.startswith(b"\x78\x01") or data.startswith(b"\x78\xda"):
         try:
             data = zlib.decompress(data)
         except Exception as e:
             print(f"[!] Zlib Fehler: {e}")
 
-    # 2. KX1 Header entfernen
     if data.startswith(b"KX1SQLite format 3"):
         data = data[3:]
     elif b"SQLite format 3" in data:
@@ -240,7 +407,14 @@ def get_full_data_payload() -> Dict[str, Any]:
         },
         "plates": plates,
         "bundeslaender": bl_stats,
-        "trip_log": APP_STATE["trip_log"]
+        "trip_log": APP_STATE["trip_log"],
+        "camera_status": {
+            "fps": CAM_STREAMER.fps,
+            "cam_index": CAM_STREAMER.cam_index,
+            "paused": CAM_STREAMER.paused,
+            "sound": CAM_STREAMER.sound_enabled,
+            "last_hit": CAM_STREAMER.last_hit
+        }
     }
 
 class RadarServerHandler(BaseHTTPRequestHandler):
@@ -258,13 +432,39 @@ class RadarServerHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # 1. Desktop Dashboard
-        if path in ("/", "/index.html", "/laptop"):
+        # 1. Desktop Minimal-Cockpit
+        if path in ("/", "/index.html", "/cockpit"):
             self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
-        # 2. Smartphone Kamera HUD
+
+        # 2. Native MJPEG Live Video Stream (30+ FPS direkt im Browser)
+        elif path == "/video_feed":
+            self.send_response(200)
+            self.send_header("Age", "0")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
+            self.end_headers()
+
+            try:
+                while True:
+                    frame_bytes = CAM_STREAMER.get_jpeg()
+                    if frame_bytes:
+                        self.wfile.write(b"--FRAME\r\n")
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(frame_bytes)))
+                        self.end_headers()
+                        self.wfile.write(frame_bytes)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(0.033)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            return
+
+        # 3. Smartphone Fallback View
         elif path in ("/cam", "/kamera", "/cam.html"):
             self.serve_file(STATIC_DIR / "cam.html", "text/html; charset=utf-8")
-        # 3. Statische Assets
+
+        # 4. Statische Assets
         elif path.startswith("/static/") or path.startswith("/web/"):
             rel_path = path.split("/", 2)[-1]
             file_path = STATIC_DIR / rel_path
@@ -274,14 +474,26 @@ class RadarServerHandler(BaseHTTPRequestHandler):
             file_path = STATIC_DIR / path.lstrip("/")
             mime = self.get_mime_type(file_path)
             self.serve_file(file_path, mime)
-        # 4. Gespeicherte Beweisfotos
+
+        # 5. Gespeicherte Beweisfotos
         elif path.startswith("/captures/"):
             rel_path = path[len("/captures/"):]
             file_path = CAPTURES_DIR / rel_path
             self.serve_file(file_path, "image/jpeg")
-        # 5. REST APIs
+
+        # 6. REST APIs
         elif path == "/api/data":
             self.send_json(get_full_data_payload())
+        elif path == "/api/status":
+            self.send_json({
+                "fps": CAM_STREAMER.fps,
+                "cam_index": CAM_STREAMER.cam_index,
+                "paused": CAM_STREAMER.paused,
+                "sound": CAM_STREAMER.sound_enabled,
+                "last_hit": CAM_STREAMER.last_hit,
+                "trip_count": len(APP_STATE["trip_log"]),
+                "summary": get_full_data_payload()["summary"]
+            })
         elif path == "/api/trip/export":
             self.export_trip_csv()
         else:
@@ -291,110 +503,23 @@ class RadarServerHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # API: KI-Kennzeichenerkennung (YOLOv8 + ALPR)
-        if path == "/api/detect":
-            content_length = int(self.headers.get("Content-Length", 0))
-            content_type = self.headers.get("Content-Type", "")
-
-            img_bytes = None
-            if "image/" in content_type:
-                img_bytes = self.rfile.read(content_length)
-            else:
-                try:
-                    payload = json.loads(self.rfile.read(content_length).decode('utf-8'))
-                    img_b64 = payload.get("image", "")
-                    if "," in img_b64:
-                        img_b64 = img_b64.split(",", 1)[1]
-                    img_bytes = base64.b64decode(img_b64)
-                except Exception as e:
-                    self.send_json({"success": False, "error": f"Payload Fehler: {e}"}, status=400)
-                    return
-
-            if not img_bytes:
-                self.send_json({"success": False, "error": "Keine Bilddaten empfangen"}, status=400)
-                return
-
-            detector = get_detector()
-            detections = detector.detect(img_bytes, conf_thresh=0.20, imgsz=480, alias_map=APP_STATE["plates_by_alias"])
-
-            # Status (missing / seen) ermitteln
-            enriched_detections = []
-            seen_map = APP_STATE["seen_map"]
-
-            for det in detections:
-                plate = det.get("plate")
-                if plate:
-                    is_seen = (plate["id"], "deutschland") in seen_map
-                    status = "seen" if is_seen else "missing"
-                    det["status"] = status
-                    det["plate"]["status"] = status
-                else:
-                    det["status"] = "unknown"
-                enriched_detections.append(det)
-
-            self.send_json({
-                "success": True,
-                "count": len(enriched_detections),
-                "detections": enriched_detections
-            })
-
-        # API: Foto-Capture mit Bounding-Box speichern & Trip erfassen
-        elif path == "/api/capture":
+        # Kamera umschalten
+        if path == "/api/camera/switch":
             content_length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(content_length).decode('utf-8'))
-            query = payload.get("query", "").strip().upper()
-            img_b64 = payload.get("image", "")
-            box = payload.get("box", {})
-            source = payload.get("source", "smartphone_cam")
-            conf = payload.get("confidence", 85)
+            idx = int(payload.get("index", 0))
+            CAM_STREAMER.set_camera(idx)
+            self.send_json({"success": True, "cam_index": idx})
 
-            if "," in img_b64:
-                img_b64 = img_b64.split(",", 1)[1]
+        # Pause / Weiter
+        elif path == "/api/camera/toggle":
+            paused = CAM_STREAMER.toggle_pause()
+            self.send_json({"success": True, "paused": paused})
 
-            try:
-                img_bytes = base64.b64decode(img_b64)
-            except Exception as e:
-                img_bytes = None
-
-            norm = query.replace("-", "").replace(" ", "")
-            plate = APP_STATE["plates_by_alias"].get(norm) or APP_STATE["plates_by_alias"].get(query)
-
-            if plate:
-                pid = plate["id"]
-                is_seen = (pid, "deutschland") in APP_STATE["seen_map"]
-                status = "seen" if is_seen else "missing"
-
-                # Foto mit passender Bounding-Box abspeichern
-                saved_filename = None
-                if img_bytes:
-                    saved_filename = self.save_annotated_capture(img_bytes, plate, box, status, conf)
-
-                time_str = datetime.now().strftime("%H:%M:%S")
-                already_in_trip = any(item["id"] == pid for item in APP_STATE["trip_log"])
-                
-                # Nur neue Funde aufnehmen
-                if not already_in_trip and status == "missing":
-                    APP_STATE["trip_log"].append({
-                        "id": pid,
-                        "kuerzel": plate["kuerzel"],
-                        "stadt_kreis": plate["stadt_kreis"],
-                        "bundesland": plate["bundesland"],
-                        "punkte": plate["punkte"],
-                        "source": source,
-                        "time": time_str,
-                        "image": saved_filename,
-                        "conf": conf
-                    })
-
-                self.send_json({
-                    "success": True,
-                    "plate": plate,
-                    "status": status,
-                    "saved_filename": saved_filename,
-                    "already_in_trip": already_in_trip
-                })
-            else:
-                self.send_json({"success": False, "error": f"Kennzeichen '{query}' nicht gefunden"}, status=404)
+        # Sound An / Aus
+        elif path == "/api/camera/sound":
+            sound = CAM_STREAMER.toggle_sound()
+            self.send_json({"success": True, "sound": sound})
 
         # API: Backup hochladen
         elif path == "/api/upload":
@@ -424,82 +549,39 @@ class RadarServerHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"success": False, "error": str(e)}, status=400)
 
-        # API: Manuell zum Trip hinzufügen
+        # API: Manuelle Eingabe zum Trip hinzufügen
         elif path == "/api/trip/add":
             content_length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(content_length).decode('utf-8'))
-            pid = payload.get("id")
-            source = payload.get("source", "manuell")
-            time_str = payload.get("time") or datetime.now().strftime("%H:%M:%S")
+            query = payload.get("query", "").strip().upper()
+            norm = query.replace("-", "").replace(" ", "")
 
-            plate = APP_STATE["plates_by_id"].get(pid)
+            plate = APP_STATE["plates_by_alias"].get(norm) or APP_STATE["plates_by_alias"].get(query)
             if plate:
-                if not any(item["id"] == pid for item in APP_STATE["trip_log"]):
+                pid = plate["id"]
+                is_seen = (pid, "deutschland") in APP_STATE["seen_map"]
+                status = "seen" if is_seen else "missing"
+
+                already_in_trip = any(item["id"] == pid for item in APP_STATE["trip_log"])
+                if not already_in_trip and status == "missing":
                     APP_STATE["trip_log"].append({
                         "id": pid,
                         "kuerzel": plate["kuerzel"],
                         "stadt_kreis": plate["stadt_kreis"],
                         "bundesland": plate["bundesland"],
                         "punkte": plate["punkte"],
-                        "source": source,
-                        "time": time_str,
+                        "source": "manuell",
+                        "time": datetime.now().strftime("%H:%M:%S"),
                         "image": None,
                         "conf": 100
                     })
-                self.send_json({"success": True, "trip_log": APP_STATE["trip_log"]})
+                self.send_json({"success": True, "plate": plate, "status": status})
             else:
-                self.send_json({"success": False, "error": "ID nicht gefunden"}, status=404)
+                self.send_json({"success": False, "error": f"Kennzeichen '{query}' nicht gefunden"}, status=404)
         else:
             self.send_error(404, "API-Endpunkt nicht gefunden")
 
-    def save_annotated_capture(self, img_bytes: bytes, plate: dict, box: dict, status: str, conf: float) -> str:
-        """Speichert das Foto mit grünem Rahmen und Zeitstempel in captures/."""
-        import cv2
-        import numpy as np
-
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-
-        h, w = img.shape[:2]
-        bx = max(0, int(box.get("x", 0.2) * w))
-        by = max(0, int(box.get("y", 0.4) * h))
-        bw = min(w - bx, int(box.get("w", 0.6) * w))
-        bh = min(h - by, int(box.get("h", 0.2) * h))
-
-        color = (46, 204, 113) if status == "missing" else (241, 196, 15) # BGR
-        line_w = max(4, int(w * 0.005))
-
-        cv2.rectangle(img, (bx, by), (bx + bw, by + bh), color, line_w)
-
-        # Banner Beschriftung
-        tag = "NEUER FUND!" if status == "missing" else "BEREITS GESEHEN"
-        label = f"[{plate['kuerzel']}] {plate.get('stadt_kreis', '')} • {tag} ({conf:.0f}%)"
-
-        font_scale = max(0.55, w / 1600.0)
-        thickness = max(2, int(w * 0.002))
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-
-        banner_y1 = max(0, by - th - 14)
-        banner_y2 = by
-        cv2.rectangle(img, (bx, banner_y1), (bx + tw + 16, banner_y2), color, -1)
-        cv2.putText(img, label, (bx + 8, by - 6), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-
-        # Zeitstempel unten rechts
-        now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        cv2.putText(img, now_str, (w - 280, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-        safe_kz = plate['kuerzel'].replace(" ", "_").replace("/", "-")
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        filename = f"{timestamp}_{safe_kz}.jpg"
-        out_path = CAPTURES_DIR / filename
-        cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        print(f"[+] Beweisfoto gesichert: {filename}")
-        return filename
-
     def export_trip_csv(self):
-        """Exportiert die während der Fahrt gesammelten Kennzeichen als CSV."""
         output = io.StringIO()
         output.write("Kürzel;Stadt/Landkreis;Bundesland;Punkte;Uhrzeit;Quelle;Beweisfoto\n")
         for item in APP_STATE["trip_log"]:
@@ -554,12 +636,15 @@ class RadarServerHandler(BaseHTTPRequestHandler):
 def run(port: int = 8080):
     load_master_data()
     auto_load_latest_backup()
+    
+    # Live-Kamerastream starten
+    CAM_STREAMER.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", port), RadarServerHandler)
     print(f"\n=======================================================")
-    print(f"🚀 KENNZEICHEN-RADAR SERVER AKTIV AUF PORT {port} (Threading / High-Speed)")
-    print(f"💻 Laptop-Dashboard: http://localhost:{port}/")
-    print(f"📱 Smartphone-Kamera: http://<Deine-WLAN-IP>:{port}/cam")
+    print(f"🚀 KENNZEICHEN-RADAR COCKPIT AKTIV AUF PORT {port}")
+    print(f"💻 Browser-Cockpit (Kein Scrollen): http://localhost:{port}/")
+    print(f"🎥 Live-Videostream (30+ FPS):       http://localhost:{port}/video_feed")
     print(f"=======================================================\n")
     try:
         server.serve_forever()
