@@ -113,7 +113,7 @@ class LiveRadarApp:
         self.backup_name = "Kein Backup"
 
         # Scan-Konfiguration
-        self.scan_interval = 1.0       # Standard: Alle 1,0 Sekunde ein hochauflösender Scan
+        self.scan_interval = 0.0       # Standard: 0.0s = ECHTZEIT-DAUER-SCAN (Blitzer-Modus ~12 Scans/Sekunde)
         self.last_scan_time = 0.0
         self.active_detections = []    # Letzte erkannte Bounding-Boxen
         self.scan_in_progress = False
@@ -278,22 +278,22 @@ class LiveRadarApp:
         """Führt den hochauflösenden Scan im Hintergrund aus, ohne den Sucher zu blockieren."""
         try:
             self.scan_count += 1
-            # Höhere Auflösung (imgsz=640) für weite Distanzen & schärfere Zeichen
-            detections = self.detector.detect(frame, conf_thresh=0.20, imgsz=640, alias_map=self.plates_by_alias)
+            # Höhere Auflösung (imgsz=640) mit sofortiger OCR-Erkennung (sync_ocr=True)
+            detections = self.detector.detect(frame, conf_thresh=0.20, imgsz=640, alias_map=self.plates_by_alias, sync_ocr=True)
             
             now = time.time()
             for det in detections:
                 plate = det.get("plate")
                 ocr_conf = det.get("ocr_confidence", 0.0)
                 
-                # Blitzer-Qualitätsfilter: Nur werten, wenn Zeichen mit mind. 50% Sicherheit verifiziert wurden
-                if plate and ocr_conf >= 50.0:
+                # Blitzer-Qualitätsfilter: Bei validem Ortskürzel ab 40% Text-Sicherheit werten
+                if plate and ocr_conf >= 40.0:
                     pid = plate["id"]
                     is_missing = pid not in self.seen_map
 
                     if is_missing:
                         last_seen_time = self.cooldown_map.get(plate['kuerzel'], 0)
-                        if now - last_seen_time > 12.0:
+                        if now - last_seen_time > 10.0:
                             self.cooldown_map[plate['kuerzel']] = now
                             saved_file = self.save_capture(frame, plate, det["box_px"], ocr_conf)
                             self.trip_log.append({
@@ -389,7 +389,7 @@ class LiveRadarApp:
                 ocr_conf = det.get("ocr_confidence", 0.0)
                 plate = det.get("plate")
 
-                if plate and ocr_conf >= 50.0:
+                if plate and ocr_conf >= 40.0:
                     pid = plate["id"]
                     is_missing = pid not in self.seen_map
                     color = (46, 204, 113) if is_missing else (241, 196, 15)
@@ -402,9 +402,9 @@ class LiveRadarApp:
                     cv2.rectangle(frame, (x1, badge_y), (x1 + tw + 14, y1), color, -1)
                     cv2.putText(frame, badge_label, (x1 + 6, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
                 else:
-                    # Bounding Box erkannt, Zeichen noch in Prüfung
+                    # Bounding Box erkannt, Zeichen noch in Prüfung oder Schild weiter entfernt
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 255), 2)
-                    scan_hint = f"Schild ({box_conf:.0f}%) • Lese Zeichen..."
+                    scan_hint = f"Schild ({box_conf:.0f}%) • Scanne..."
                     cv2.putText(frame, scan_hint, (x1 + 4, max(15, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 215, 255), 2)
 
             # 3. FPS-Berechnung für flüssigen 60 FPS Sucher
@@ -417,7 +417,13 @@ class LiveRadarApp:
             cv2.rectangle(frame, (0, 0), (w, 48), (15, 23, 42), -1)
 
             cam_name = "Handy (Cam 1)" if self.cam_index == 1 else f"Kamera {self.cam_index}"
-            scan_pulse = "⚡ SCAN..." if self.scan_in_progress else f"Takt: {self.scan_interval:.1f}s"
+            if self.scan_interval <= 0.05:
+                scan_pulse = "⚡ ECHTZEIT-BLITZER (~12/s)"
+            elif self.scan_in_progress:
+                scan_pulse = "⚡ SCAN..."
+            else:
+                scan_pulse = f"Takt: {self.scan_interval:.1f}s"
+
             boost_str = " | Boost: AN" if self.night_boost else ""
             cur_zoom = self.zoom_levels[self.zoom_idx]
             zoom_str = f" | 🔍 {cur_zoom:.0f}x" if cur_zoom > 1.0 else " | 🔍 1x"
@@ -464,8 +470,11 @@ class LiveRadarApp:
                 self.scan_interval = min(5.0, round(self.scan_interval + 0.2, 1))
                 print(f"[+] Scan-Intervall auf {self.scan_interval}s erhöht")
             elif key == ord('-'):
-                self.scan_interval = max(0.4, round(self.scan_interval - 0.2, 1))
-                print(f"[-] Scan-Intervall auf {self.scan_interval}s verkürzt")
+                self.scan_interval = max(0.0, round(self.scan_interval - 0.2, 1))
+                if self.scan_interval <= 0.05:
+                    print("[-] Scan-Modus: ⚡ ECHTZEIT-DAUER-SCAN (Maximale Geschwindigkeit)")
+                else:
+                    print(f"[-] Scan-Intervall auf {self.scan_interval}s verkürzt")
             elif key == ord('e'):
                 self.night_boost = not self.night_boost
                 print(f"[+] Nacht-Boost: {'Aktiviert' if self.night_boost else 'Deaktiviert'}")

@@ -90,78 +90,87 @@ class FastLicensePlateDetector:
         cy = int(((y1 + y2) / 2) / (h / 10))
         return f"{cx}_{cy}"
 
-    def _async_ocr_worker(self, crop: np.ndarray, grid_key: str, alias_map: Dict[str, Any]):
+    def read_plate_crop(self, crop: np.ndarray, alias_map: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]], float]:
         """
-        Chirurgische deutsche Zonen-Erkennung:
-        - Schneidet den blauen EU-Balken (0% bis 15%) ab -> Buchstabe 'D' wird ignoriert
-        - Schneidet die Plaketten & Zufallsbuchstaben (ab 48%) ab -> keine 'ML' oder Zahlen
-        - Liest nur die isolierten 1 bis 3 Ortsbuchstaben mit 99%+ Sicherheit!
+        Liest das deutsche Ortskürzel direkt aus dem Kennzeichen-Ausschnitt:
+        - DIN-Norm Schnitt (~10% bis 48% der Schildbreite)
+        - Schneidet den blauen EU-Balken ab
+        - CLAHE Kontrastverstärkung & optimale Skalierung
+        - Schnelle FE-Schrift OCR
+        - Intelligenter Stammdaten-Abgleich mit Präfix-Prüfung (z. B. 'BAD', 'HH', 'B')
+        - Erkennt gängige Zeichen-Verwechslungen (0 <-> O, 1 <-> I, 8 <-> B)
         """
-        now = time.time()
+        if crop is None or crop.size == 0:
+            return None, None, 0.0
+
+        ch, cw = crop.shape[:2]
+        if ch < 10 or cw < 20:
+            return None, None, 0.0
+
         try:
-            ch, cw = crop.shape[:2]
-            if ch < 12 or cw < 24:
-                self.failed_cache[grid_key] = now
-                return
-
-            # DIN-Norm Schnitt: Das Ortskürzel liegt IMMER zwischen 15% und 48% der Schildbreite
-            x_start = int(cw * 0.15)
-            x_end = int(cw * 0.49)
-            city_crop = crop[:, x_start:x_end]
-
-            # Auf optimale Erkennungshöhe (70px) skalieren & Kontrast stärken
-            target_h = 70
-            scale = target_h / max(city_crop.shape[0], 1)
-            target_w = max(int(city_crop.shape[1] * scale), 10)
-            city_scaled = cv2.resize(city_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-
-            # CLAHE Kontrastverstärkung
-            gray = cv2.cvtColor(city_scaled, cv2.COLOR_BGR2GRAY)
+            # Zone 1: DIN-Norm Schnitt auf Orts-Zone (10% bis 48%)
+            z1 = crop[:, int(cw * 0.10):int(cw * 0.48)]
+            scale = 70.0 / max(z1.shape[0], 1)
+            tw = max(int(z1.shape[1] * scale), 10)
+            z1_scaled = cv2.resize(z1, (tw, 70), interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(z1_scaled, cv2.COLOR_BGR2GRAY)
             clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
             enhanced = clahe.apply(gray)
 
-            # 1. Direkter Scan auf der isolierten Orts-Zone
-            results = self.ocr.readtext(enhanced, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', detail=1)
+            results = self.ocr.readtext(enhanced, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ÄÖÜ', detail=1)
 
-            matched_code = None
-            matched_plate = None
-            matched_conf = 0.0
+            # Fallback: Breitere Zone (8% bis 58%), falls Zone 1 nichts lieferte
+            if not results:
+                z2 = crop[:, int(cw * 0.08):int(cw * 0.58)]
+                s2 = 70.0 / max(z2.shape[0], 1)
+                tw2 = max(int(z2.shape[1] * s2), 10)
+                z2_scaled = cv2.resize(z2, (tw2, 70), interpolation=cv2.INTER_CUBIC)
+                g2 = cv2.cvtColor(z2_scaled, cv2.COLOR_BGR2GRAY)
+                enh2 = clahe.apply(g2)
+                results = self.ocr.readtext(enh2, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ÄÖÜ', detail=1)
 
-            candidates = []
+            if not results:
+                return None, None, 0.0
+
+            best_match = (None, None, 0.0)
             for bbox, text, conf in results:
-                clean = re.sub(r'[^A-ZÄÖÜ]', '', text.upper())
-                if 1 <= len(clean) <= 3:
-                    candidates.append((clean, float(conf)))
+                raw = re.sub(r'[^A-Z0-9ÄÖÜ]', '', text.upper())
+                if not raw:
+                    continue
 
-            # Fallback: Falls der enge Schnitt nichts lieferte, etwas breiteren Bereich (12% bis 52%) versuchen
-            if not candidates:
-                fallback_crop = crop[:, int(cw * 0.12):int(cw * 0.52)]
-                fb_h, fb_w = fallback_crop.shape[:2]
-                fb_scaled = cv2.resize(fallback_crop, (int(fb_w * 70 / fb_h), 70), interpolation=cv2.INTER_CUBIC)
-                fb_res = self.ocr.readtext(fb_scaled, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', detail=1)
-                for bbox, text, conf in fb_res:
-                    clean = re.sub(r'[^A-ZÄÖÜ]', '', text.upper())
-                    if 1 <= len(clean) <= 3:
-                        candidates.append((clean, float(conf)))
+                # Kandidaten prüfen: Von Länge min(3, len(raw)) runter auf 1 (längste Präfixe zuerst)
+                candidates = []
+                for l in range(min(3, len(raw)), 0, -1):
+                    candidates.append(raw[:l])
 
-            # Gegen die 1.069 Kennzeichen-Stammdaten abgleichen
-            for tok, conf in candidates:
-                variants = [
-                    (tok, conf),
-                    (tok.replace("0", "O").replace("1", "I").replace("8", "B"), conf * 0.95),
-                    (tok.replace("O", "0"), conf * 0.95)
-                ]
-                for var, v_conf in variants:
-                    if alias_map and var in alias_map:
-                        matched_code = var
-                        matched_plate = alias_map[var]
-                        matched_conf = round(v_conf * 100, 1)
+                for cand in candidates:
+                    variants = [
+                        (cand, conf),
+                        (cand.replace('0', 'O').replace('1', 'I').replace('8', 'B'), conf * 0.95),
+                        (cand.replace('O', '0'), conf * 0.95),
+                        (cand.replace('B', '8'), conf * 0.90)
+                    ]
+                    for var, v_conf in variants:
+                        if alias_map and var in alias_map:
+                            conf_pct = round(float(v_conf) * 100, 1)
+                            if conf_pct > best_match[2]:
+                                best_match = (var, alias_map[var], conf_pct)
+                                break
+                    if best_match[0]:
                         break
-                if matched_code:
+                if best_match[0]:
                     break
 
-            # Blitzer-Qualitätsgrenze: Mindestens 50% Text-Sicherheit
-            if matched_code and matched_conf >= 50.0:
+            return best_match
+        except Exception as e:
+            return None, None, 0.0
+
+    def _async_ocr_worker(self, crop: np.ndarray, grid_key: str, alias_map: Dict[str, Any]):
+        """Asynchroner Fallback-Worker für Legacy-Aufrufe."""
+        now = time.time()
+        try:
+            matched_code, matched_plate, matched_conf = self.read_plate_crop(crop, alias_map)
+            if matched_code and matched_conf >= 40.0:
                 self.tracked_cache[grid_key] = {
                     "code": matched_code,
                     "plate": matched_plate,
@@ -173,15 +182,15 @@ class FastLicensePlateDetector:
             else:
                 self.failed_cache[grid_key] = now
         except Exception as e:
-            print(f"[!] OCR Fehler: {e}")
             self.failed_cache[grid_key] = now
         finally:
             self.pending_crops.discard(grid_key)
 
-    def detect(self, img_input: Any, conf_thresh: float = 0.20, imgsz: int = 480, alias_map: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    def detect(self, img_input: Any, conf_thresh: float = 0.20, imgsz: int = 640, alias_map: Dict[str, Any] = None, sync_ocr: bool = True) -> List[Dict[str, Any]]:
         """
-        High-Speed Objekterkennung mit OpenVINO in ~11ms.
-        Gibt sofort Bounding-Boxen zurück; präzise Zonen-OCR läuft parallel in ~40ms.
+        High-Speed Objekterkennung mit OpenVINO (~12ms) & sofortigem Zonen-OCR (~55ms).
+        - sync_ocr=True (Standard): OCR wird SOFORT auf dem erkannten Schild ausgeführt.
+          Kein Warten auf Folgebilder, keine verpassten Kennzeichen bei Vorbeifahrten!
         """
         img, w, h = self._prepare_image(img_input)
         now = time.time()
@@ -190,7 +199,7 @@ class FastLicensePlateDetector:
         self.tracked_cache = {k: v for k, v in self.tracked_cache.items() if now - v["time"] < 4.0}
         self.failed_cache = {k: t for k, t in self.failed_cache.items() if now - t < 1.2}
 
-        # 1. OpenVINO hardware-beschleunigte Inferenz (nur 11ms!)
+        # 1. OpenVINO hardware-beschleunigte Inferenz
         results = self.yolo(img, conf=conf_thresh, imgsz=imgsz, verbose=False)
         detections = []
 
@@ -220,25 +229,44 @@ class FastLicensePlateDetector:
                 "h": round(box_h / h, 4)
             }
 
-            cached = self.tracked_cache.get(grid_key)
-            matched_code = cached["code"] if cached else None
-            matched_plate = cached["plate"] if cached else None
-            ocr_conf = cached["ocr_conf"] if cached else 0.0
-            raw_text = cached["raw_text"] if cached else ""
+            matched_code = None
+            matched_plate = None
+            ocr_conf = 0.0
+            raw_text = ""
 
-            is_failed_recent = (now - self.failed_cache.get(grid_key, 0)) < 1.2
-            if not cached and grid_key not in self.pending_crops and len(self.pending_crops) < 1 and not is_failed_recent:
-                pad_x = int(box_w * 0.04)
-                pad_y = int(box_h * 0.04)
-                crop_x1 = max(0, x1 - pad_x)
-                crop_y1 = max(0, y1 - pad_y)
-                crop_x2 = min(w, x2 + pad_x)
-                crop_y2 = min(h, y2 + pad_y)
+            pad_x = int(box_w * 0.04)
+            pad_y = int(box_h * 0.04)
+            crop_x1 = max(0, x1 - pad_x)
+            crop_y1 = max(0, y1 - pad_y)
+            crop_x2 = min(w, x2 + pad_x)
+            crop_y2 = min(h, y2 + pad_y)
+            crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
 
-                crop = img[crop_y1:crop_y2, crop_x1:crop_x2].copy()
-                if crop.size > 0:
-                    self.pending_crops.add(grid_key)
-                    self.ocr_pool.submit(self._async_ocr_worker, crop, grid_key, alias_map)
+            if sync_ocr:
+                # ECHTZEIT-BLITZER-MODUS: OCR sofort ausführen, wenn Schild groß genug ist
+                if box_w >= 24 and box_h >= 10 and crop.size > 0:
+                    matched_code, matched_plate, ocr_conf = self.read_plate_crop(crop, alias_map)
+                    if matched_code and ocr_conf >= 40.0:
+                        raw_text = f"[{matched_code}] {ocr_conf:.0f}%"
+                        self.tracked_cache[grid_key] = {
+                            "code": matched_code,
+                            "plate": matched_plate,
+                            "ocr_conf": ocr_conf,
+                            "raw_text": raw_text,
+                            "time": now
+                        }
+            else:
+                # Asynchroner Modus mit Cache
+                cached = self.tracked_cache.get(grid_key)
+                if cached:
+                    matched_code = cached["code"]
+                    matched_plate = cached["plate"]
+                    ocr_conf = cached["ocr_conf"]
+                    raw_text = cached["raw_text"]
+                elif grid_key not in self.pending_crops and len(self.pending_crops) < 1:
+                    if crop.size > 0:
+                        self.pending_crops.add(grid_key)
+                        self.ocr_pool.submit(self._async_ocr_worker, crop.copy(), grid_key, alias_map)
 
             detections.append({
                 "box": norm_box,
